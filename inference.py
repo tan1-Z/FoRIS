@@ -1,4 +1,4 @@
-"""INSID3 inference script."""
+"""FoRIS inference script (legacy logging entry point)."""
 
 import argparse
 import datetime
@@ -55,7 +55,7 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
     ds = build_dataset(args.dataset, args=args)
     loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=args.num_workers,
                         collate_fn=lambda x: x[0])
-    meter = AverageMeter(args.dataset, ds.class_ids)
+    meter = AverageMeter(args.dataset, list(ds.class_ids), device=args.device)
 
     # ──────── Evaluation loop ────────
     pbar = tqdm(loader, ncols=80)
@@ -96,7 +96,8 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
             pred_mask, tgt_mask,
             tgt_ignore_idx=tgt_ignore_idx,
         )
-        meter.update(area_inter, area_union, batch['class_id'].cuda())
+        class_id = torch.as_tensor(batch['class_id'], device=args.device).reshape(-1)
+        meter.update(area_inter, area_union, class_id)
 
         fg_union = area_union[1].clamp_min(1.0)
         episode_iou = (area_inter[1] / fg_union * 100.0).item()
@@ -126,7 +127,7 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser('INSID3 inference', parents=[opts.get_args_parser()])
+    parser = argparse.ArgumentParser('FoRIS inference', parents=[opts.get_args_parser()])
     args = parser.parse_args()
     timestamp = datetime.datetime.now().strftime('%m%d_%H%M')
     args.output_dir = join(args.output_dir, f'{args.exp_name}_{timestamp}')

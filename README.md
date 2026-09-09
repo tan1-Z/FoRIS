@@ -135,6 +135,29 @@ Supported benchmarks:
 
 Run evaluation on a prepared dataset (default data root: `data/`):
 
+### Conservative Risk-Gated Affinity Fusion (experimental)
+
+The optimized multi-layer entry point extracts a compact DINOv3 layer set,
+routes high-margin episodes to one layer, and otherwise fuses the top-risk
+layers plus the deepest semantic anchor:
+
+```bash
+python inference_segmentation.py \
+  --dataset coco \
+  --data-root data \
+  --weights pretrain/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth \
+  --feature-layers auto \
+  --layer-selector conservative \
+  --save-routing \
+  --exp-name foris-crgaf-coco
+```
+
+Per-episode risks, APD decisions, active layers, and affinity weights are saved
+to `routing.jsonl`; aggregate accuracy, routing frequencies, and runtime are
+saved to `summary.json`. This path is an experimental extension and is not the
+paper-exact configuration. To run the released single-layer formulation, use
+`--feature-layers 23 --layer-selector last`.
+
 ```bash
 # COCO-20^i — 4 folds
 python inference.py --dataset coco --exp-name foris-coco --crf-mask-refinement --fold 0

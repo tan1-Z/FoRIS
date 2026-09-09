@@ -29,6 +29,27 @@ def get_args_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Enable CRF-based mask refinement.",
     )
+    parser.add_argument("--dinov3-repo", default=None,
+                        help="Local DINOv3 repository; defaults to DINOV3_REPO or GitHub.")
+    parser.add_argument("--weights", default=None,
+                        help="DINOv3 checkpoint; defaults to DINOV3_WEIGHTS or pretrain/.")
+    # Adaptive Multi-Level + Local Token Refinement (all opt-in for baseline ablations).
+    parser.add_argument("--adaptive_multilayer", action="store_true")
+    parser.add_argument("--multilayer_ids", default=None,
+                        help="Optional comma-separated zero-based DINO block ids.")
+    parser.add_argument("--layer_fusion_temperature", default=0.5, type=float)
+    parser.add_argument("--geometry_layer_weight", default=1.0, type=float)
+    parser.add_argument("--use_soft_token_masks", action="store_true")
+    parser.add_argument("--soft_fg_cluster_min", default=0.10, type=float)
+    parser.add_argument("--local_refine", action="store_true")
+    parser.add_argument("--local_refine_size", default=512, type=int)
+    parser.add_argument("--local_refine_topk", default=3, type=int)
+    parser.add_argument("--local_refine_quantile", default=0.90, type=float)
+    parser.add_argument("--local_refine_margin_tokens", default=2, type=int)
+    parser.add_argument("--local_refine_area_budget", default=0.25, type=float)
+    parser.add_argument("--local_refine_alpha", default=0.5, type=float)
+    parser.add_argument("--local_refine_miss_weight", default=0.5, type=float)
+    parser.add_argument("--local_refine_boundary_weight", default=0.5, type=float)
 
     # Episode
     parser.add_argument(

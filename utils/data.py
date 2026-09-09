@@ -51,3 +51,15 @@ def downsample_mask(mask: torch.Tensor, h: int, w: int) -> torch.Tensor:
             cy, cx = (center / scale).int()
             down[cy, cx] = True
     return down
+
+
+def downsample_mask_soft(mask: torch.Tensor, h: int, w: int) -> torch.Tensor:
+    """Return foreground occupancy for every feature token.
+
+    Unlike :func:`downsample_mask`, this deliberately preserves fractional
+    coverage.  It is important for thin objects: a patch with 10% foreground
+    remains useful evidence instead of being discarded by a ``> 0.5`` test.
+    """
+    if mask.ndim != 4:
+        raise ValueError(f"Expected (N, C, H, W) mask, got {tuple(mask.shape)}")
+    return F.interpolate(mask.float(), size=(h, w), mode="area").clamp_(0.0, 1.0)[0, 0]

@@ -578,52 +578,22 @@ class FoRIS(nn.Module):
         dtype = tgt_feat.dtype
         tgt_norm = F.normalize(tgt_feat, p=2, dim=1)
 
-        # Soft top-k foreground evidence: preserve the original affinity and
-        # normalization path, changing only top-1 binary voting.
-        soft_sum = torch.zeros((h, w), dtype=dtype, device=device)
-        temperature = max(1e-4, float(self.cluster_logsumexp_temp))
-        yy, xx = torch.meshgrid(
-            torch.arange(h, device=device),
-            torch.arange(w, device=device),
-            indexing="ij",
-        )
-        yy, xx = yy.unsqueeze(-1), xx.unsqueeze(-1)
-        mutual_radius = 1
+        votes = torch.zeros((h, w), dtype=torch.int32, device=device)
         for m in range(n_refs):
             ref_m = F.normalize(ref_feats[0:1, m], p=2, dim=2)
             sim_m = torch.einsum("bchw,bcxy->bhwxy", ref_m, tgt_norm)
             sim0 = sim_m[0]
             Hs, Ws = sim0.shape[:2]
             sim_t_to_r = sim0.permute(2, 3, 0, 1)
-            sim_flat = sim_t_to_r.reshape(h, w, -1)
-            k_eff = min(5, Hs * Ws)
-            topk_vals, topk_idx = torch.topk(sim_flat, k=k_eff, dim=-1)
+            best_idx = sim_t_to_r.reshape(h, w, -1).argmax(dim=2)
+            rows = best_idx // Ws
+            cols = best_idx % Ws
             ref_mask_m = downsample_mask(ref_masks[m : m + 1], Hs, Ws).squeeze(0)
-            topk_mask = ref_mask_m.reshape(-1)[topk_idx].to(dtype=dtype)
-            weights = torch.softmax(topk_vals / temperature, dim=-1)
-            support_soft_c1 = (weights * topk_mask).sum(dim=-1)
+            votes += ref_mask_m[rows, cols].to(torch.int32)
 
-            # Reuse sim0 for a single reverse argmax; no second affinity is made.
-            back_best_idx = sim0.reshape(Hs * Ws, h * w).argmax(dim=-1)
-            topk_back_idx = back_best_idx[topk_idx]
-            back_rows, back_cols = topk_back_idx // w, topk_back_idx % w
-            mutual_mask = (
-                (back_rows - yy).abs() <= mutual_radius
-            ) & ((back_cols - xx).abs() <= mutual_radius)
-            mutual_weights = weights * mutual_mask.to(dtype=weights.dtype)
-            mutual_mass = mutual_weights.sum(dim=-1, keepdim=True)
-            weights_mutual = mutual_weights / mutual_mass.clamp_min(1e-8)
-            support_soft_mutual = (weights_mutual * topk_mask).sum(dim=-1)
-            support_soft = torch.where(
-                mutual_mass.squeeze(-1) > 1e-8,
-                support_soft_mutual,
-                support_soft_c1,
-            )
-            soft_sum += support_soft
-
-        vote_soft = (soft_sum / float(max(1, n_refs))).clamp(0.0, 1.0)
-        candidate_threshold = math.ceil(n_refs / 2) / float(max(1, n_refs))
-        candidates_mask = vote_soft >= candidate_threshold
+        candidates_mask = votes >= math.ceil(n_refs / 2)
+       
+        vote_soft = votes.to(dtype=dtype) / float(max(1, n_refs))
 
         return candidates_mask,  vote_soft
 

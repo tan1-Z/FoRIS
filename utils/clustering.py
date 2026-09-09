@@ -22,13 +22,35 @@ def agglomerative_clustering(X: torch.Tensor, tau: float) -> torch.Tensor:
         return torch.zeros(n, dtype=torch.long, device=X.device)
 
     S = (X @ X.T).clamp(-1, 1)
-    D = (1.0 - S).cpu().numpy()
+    return agglomerative_clustering_from_similarity(S, tau=tau)
+
+
+def agglomerative_clustering_from_similarity(
+    similarity: torch.Tensor,
+    tau: float,
+) -> torch.Tensor:
+    """Cluster a precomputed square cosine-like similarity matrix."""
+    if similarity.ndim != 2 or similarity.shape[0] != similarity.shape[1]:
+        raise ValueError(
+            "similarity must be a square (N, N) matrix, got "
+            f"{tuple(similarity.shape)}"
+        )
+    n = similarity.shape[0]
+    if n <= 1:
+        return torch.zeros(n, dtype=torch.long, device=similarity.device)
+
+    similarity = similarity.clamp(-1, 1)
+    # Numerical symmetrization protects sklearn from small accumulation drift
+    # when several layer affinities are fused in mixed precision.
+    similarity = 0.5 * (similarity + similarity.T)
+    similarity.fill_diagonal_(1.0)
+    D = (1.0 - similarity).float().cpu().numpy()
     ac = AgglomerativeClustering(
         n_clusters=None, metric='precomputed',
         linkage='average', distance_threshold=float(1.0 - tau),
     )
     labels = ac.fit_predict(D)
-    return torch.from_numpy(labels).long().to(X.device)
+    return torch.from_numpy(labels).long().to(similarity.device)
 
 
 def compute_cluster_prototypes(X: torch.Tensor, labels: torch.Tensor, K: int) -> torch.Tensor:

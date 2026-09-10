@@ -374,27 +374,37 @@ class FoRIS(nn.Module):
         n_refs: int,
         *,
         mu_fg_per_reference: bool,
+        ref_occupancy: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None:
         """Build mu_fg, hard-negative mu_bg, and optional clustered FG prototypes."""
         ref_means: list[torch.Tensor] = []
         fg_cols: list[torch.Tensor] = []
         bg_cols: list[torch.Tensor] = []
+        fg_weight_cols: list[torch.Tensor] = []
+        bg_weight_cols: list[torch.Tensor] = []
 
         for s in range(n_refs):
             feat_s = ref_feats[0, s]
             m = ref_masks_bool[s]
             fg = feat_s[:, m]
             bg = feat_s[:, ~m]
+            occ = None if ref_occupancy is None else ref_occupancy[s]
             if fg.shape[1] > 0:
                 fg_cols.append(fg)
-                ref_means.append(fg.mean(dim=1))
+                fg_w = None if occ is None else occ[m]
+                ref_means.append(fg.mean(dim=1) if fg_w is None else self._weighted_token_mean(fg, fg_w))
+                if fg_w is not None:
+                    fg_weight_cols.append(fg_w)
             if bg.shape[1] > 0:
                 bg_cols.append(bg)
+                if occ is not None:
+                    bg_weight_cols.append(1.0 - occ[~m])
 
         if len(fg_cols) == 0:
             return None
 
         fg_tokens = torch.cat(fg_cols, dim=1)
+        fg_weights = torch.cat(fg_weight_cols, dim=0) if ref_occupancy is not None else None
         if mu_fg_per_reference:
             mu_fg = F.normalize(torch.stack(ref_means, dim=0).mean(dim=0), p=2, dim=0)
         else:
@@ -406,7 +416,11 @@ class FoRIS(nn.Module):
             k_hard = max(1, int(0.2 * sim_bg.numel()))
             topk_idx = torch.topk(sim_bg, k=k_hard).indices
             hard_bg = bg_tokens_cat[:, topk_idx]
-            mu_bg = F.normalize(hard_bg.mean(dim=1), dim=0)
+            if ref_occupancy is None:
+                mu_bg = F.normalize(hard_bg.mean(dim=1), dim=0)
+            else:
+                bg_weights = torch.cat(bg_weight_cols, dim=0)
+                mu_bg = F.normalize(self._weighted_token_mean(hard_bg, bg_weights[topk_idx]), dim=0)
         else:
             mu_bg = torch.zeros_like(mu_fg)
 
@@ -415,9 +429,27 @@ class FoRIS(nn.Module):
             x_fg = F.normalize(fg_tokens.transpose(0, 1), p=2, dim=1)
             labels_fg = agglomerative_clustering(x_fg, tau=self.tau)
             k_fg = int(labels_fg.max().item()) + 1
-            fg_protos = compute_cluster_prototypes(x_fg, labels_fg, K=k_fg)
+            if ref_occupancy is None:
+                fg_protos = compute_cluster_prototypes(x_fg, labels_fg, K=k_fg)
+            else:
+                fallback = compute_cluster_prototypes(x_fg, labels_fg, K=k_fg)
+                ws = fg_weights.to(x_fg.device, x_fg.dtype).clamp_min(0)
+                sums = torch.zeros((k_fg, x_fg.shape[1]), device=x_fg.device, dtype=x_fg.dtype)
+                sums.index_add_(0, labels_fg, x_fg * ws.unsqueeze(1))
+                wsum = torch.zeros(k_fg, device=x_fg.device, dtype=x_fg.dtype)
+                wsum.index_add_(0, labels_fg, ws)
+                fg_protos = torch.where((wsum > 1e-8).unsqueeze(1), sums / wsum.clamp_min(1e-8).unsqueeze(1), fallback)
+                fg_protos = F.normalize(fg_protos, p=2, dim=1)
 
         return mu_fg, mu_bg, fg_protos
+
+    @staticmethod
+    def _weighted_token_mean(feat_cn: torch.Tensor, weights_n: torch.Tensor, *, eps: float = 1e-8) -> torch.Tensor:
+        weights = weights_n.to(feat_cn.device, feat_cn.dtype).clamp_min(0)
+        denom = weights.sum()
+        if float(denom) <= eps:
+            return feat_cn.mean(dim=1)
+        return (feat_cn * weights.unsqueeze(0)).sum(dim=1) / denom
 
     def _part2_stage1_feature_gating(
         self,
@@ -487,11 +519,13 @@ class FoRIS(nn.Module):
             [downsample_mask(ref_masks[s : s + 1], h, w) for s in range(n_refs)],
             dim=0,
         )
+        ref_occupancy_ds = F.interpolate(ref_masks.float(), size=(h, w), mode="area").squeeze(1).clamp(0, 1)
         stats = self._reference_contrastive_prototypes(
             ref_feats,
             ref_masks_ds,
             n_refs,
             mu_fg_per_reference=True,
+            ref_occupancy=ref_occupancy_ds,
         )
         if stats is None:
             return None

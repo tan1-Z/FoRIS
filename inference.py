@@ -2,6 +2,7 @@
 
 import argparse
 import datetime
+import json
 import os
 import random
 import sys
@@ -55,7 +56,10 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
     ds = build_dataset(args.dataset, args=args)
     loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=args.num_workers,
                         collate_fn=lambda x: x[0])
-    meter = AverageMeter(args.dataset, list(ds.class_ids), device=args.device)
+    # Original FoRIS metrics implementations differ on whether ``device`` is
+    # accepted; their default CUDA buffers match the supported GPU workflow.
+    meter = AverageMeter(args.dataset, list(ds.class_ids))
+    component_records = []
 
     # ──────── Evaluation loop ────────
     pbar = tqdm(loader, ncols=80)
@@ -101,6 +105,10 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
 
         fg_union = area_union[1].clamp_min(1.0)
         episode_iou = (area_inter[1] / fg_union * 100.0).item()
+        analysis = getattr(model, "last_hg_part4_analysis", None)
+        if analysis is not None:
+            component_records.append({"episode_index": int(idx), "class_id": int(class_id[0].item()),
+                                      "num_shots": int(len(ref_imgs)), "episode_iou": float(episode_iou), "hg": analysis})
         # save_episode_visualizations(
         #     reference_image=ref_imgs[0],
         #     reference_mask=ref_masks[0],
@@ -123,6 +131,17 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
     print(out_str)
     with open(log_file, 'a') as fp:
         fp.write(out_str + '\n')
+    def avg(key):
+        xs = [r["hg"][key] for r in component_records]
+        return float(np.mean(xs)) if xs else None
+    def correlation(key):
+        x=np.array([r["episode_iou"] for r in component_records]); y=np.array([r["hg"][key] for r in component_records])
+        return float(np.corrcoef(x,y)[0,1]) if len(x)>=2 and np.isfinite(x).all() and np.isfinite(y).all() and x.std()>1e-12 and y.std()>1e-12 else None
+    summary={"mode":"original_symmetric_hg_gate","num_episodes":len(component_records),"miou":float(miou),"hg_gate_mean":avg("hg_gate_mean"),"raw_reliability_mean":avg("raw_reliability_mean"),"negative_retention_ratio_mean":avg("negative_retention_ratio"),"positive_retention_ratio_mean":avg("positive_retention_ratio"),"empty_hypergraph_fallback_count":int(sum(r["hg"]["empty_hypergraph_fallback"] for r in component_records)),"gate_formula_error_abs_max":max([r["hg"]["gate_formula_error_abs_max"] for r in component_records],default=None),"correction_retention_ratio_mean":avg("correction_retention_ratio"),"sign_flip_count_total":int(sum(r["hg"]["sign_flip_count"] for r in component_records)),"corr_episode_iou_vs_negative_retention":correlation("negative_retention_ratio")}
+    payload={"component":{"name":"part4_evidence_consistency_hypergraph_gate","mode":"original_symmetric_hg_gate","description":"Part-4 cluster corrections are symmetrically attenuated by an evidence-consistency hypergraph gate.","gate_formula":"gate = 0.5 + 0.5 * raw_reliability","hyperedges":["sf_foreground_support","candidate_support","seed_prior_support"],"gate_range":[.5,1.]},"run":{"dataset":str(args.dataset),"exp_name":str(args.exp_name),"seed":int(args.seed),"num_episodes":len(component_records),"output_dir":str(args.output_dir)},"summary":summary,"episodes":component_records}
+    analysis_path=join(args.output_dir,"hg_part4_component_analysis.json")
+    with open(analysis_path,"w",encoding="utf-8") as fp: json.dump(payload,fp,indent=2,ensure_ascii=False)
+    print(f"HG component analysis saved to: {analysis_path}")
     return miou
 
 

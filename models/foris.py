@@ -97,6 +97,7 @@ class FoRIS(nn.Module):
         self._orig_tgt_size = None
 
         self.should_debiass = True
+        self.last_hg_part4_analysis = None
 
     # ──────────────────────── Public API ────────────────────────
 
@@ -816,6 +817,8 @@ class FoRIS(nn.Module):
         tgt_feat: torch.Tensor,
         sf: torch.Tensor,
         sbn: torch.Tensor,
+        cand_soft: torch.Tensor,
+        seed_prior: torch.Tensor,
     ) -> torch.Tensor:
         """Cluster-level boost for pure-fg clusters, suppress conflicted clusters."""
         _, c_t, h_t, w_t = tgt_feat.shape
@@ -824,9 +827,11 @@ class FoRIS(nn.Module):
         labels_t = agglomerative_clustering(xt, tau=self.tau)
         k_t = int(labels_t.max().item()) + 1
 
-        sf_flat = sf.reshape(-1)
-        sb_flat = sbn.reshape(-1)
+        sf_flat, sb_flat = sf.reshape(-1), sbn.reshape(-1)
+        cand_flat, seed_flat = cand_soft.reshape(-1), seed_prior.reshape(-1)
         delta_cluster = torch.zeros(k_t, device=sf.device, dtype=sf.dtype)
+        cluster_sf = torch.zeros_like(delta_cluster); cluster_sb = torch.zeros_like(delta_cluster)
+        cluster_cand = torch.zeros_like(delta_cluster); cluster_seed = torch.zeros_like(delta_cluster)
 
         for k_idx in range(k_t):
             mk = labels_t == k_idx
@@ -834,6 +839,8 @@ class FoRIS(nn.Module):
                 continue
             fg_mean = sf_flat[mk].mean()
             bg_mean = sb_flat[mk].mean()
+            cluster_sf[k_idx], cluster_sb[k_idx] = fg_mean, bg_mean
+            cluster_cand[k_idx], cluster_seed[k_idx] = cand_flat[mk].mean(), seed_flat[mk].mean()
             fg_pure = (fg_mean - bg_mean).clamp_min(0.0)
             conflict = torch.minimum(fg_mean, bg_mean)
             delta_k = (
@@ -841,8 +848,43 @@ class FoRIS(nn.Module):
                 - self.semantic_cluster_conflict_suppress * conflict
             )
             delta_cluster[k_idx] = delta_k.clamp_min(-self.semantic_cluster_neg_cap)
-
-        return delta_cluster[labels_t].view(h_t, w_t)
+        H = torch.stack([(2*(cluster_sf-.5)).clamp(0,1), (2*(cluster_cand-.5)).clamp(0,1), (2*(cluster_seed-.5)).clamp(0,1)], 1)
+        degrees = H.sum(0); valid = degrees > 1e-8
+        if bool(valid.any()):
+            Hv = H[:, valid]; ed = Hv.sum(0).clamp_min(1e-8); nd = Hv.sum(1).clamp_min(1e-8)
+            base = (Hv / ed.unsqueeze(0)) @ Hv.T; inv = nd.rsqrt()
+            theta = inv.unsqueeze(1) * base * inv.unsqueeze(0)
+            direct = Hv.mean(1); group = theta @ direct
+            raw_reliability = (.5 * direct + .5 * group).clamp(0, 1)
+            gate = (.5 + .5 * raw_reliability).clamp(.5, 1)
+            formula_error = float((gate - (.5 + .5 * raw_reliability).clamp(.5, 1)).abs().max())
+        else:
+            direct = group = raw_reliability = torch.zeros_like(delta_cluster); gate = torch.ones_like(delta_cluster); formula_error = 0.0
+        final = gate * delta_cluster
+        pos, neg = delta_cluster > 0, delta_cluster < 0
+        mean_if = lambda x, m: float(x[m].abs().mean()) if bool(m.any()) else 0.0
+        base_sum = delta_cluster.abs().sum()
+        pos_ret = float(final[pos].abs().sum() / delta_cluster[pos].abs().sum().clamp_min(1e-8)) if bool(pos.any()) else 1.0
+        neg_ret = float(final[neg].abs().sum() / delta_cluster[neg].abs().sum().clamp_min(1e-8)) if bool(neg.any()) else 1.0
+        self.last_hg_part4_analysis = {
+            "enabled": True, "mode": "original_symmetric_hg_gate", "num_clusters": int(k_t), "num_valid_hyperedges": int(valid.sum()),
+            "edge_degree_sf": float(degrees[0]), "edge_degree_cand": float(degrees[1]), "edge_degree_seed": float(degrees[2]),
+            "cluster_sf_mean": float(cluster_sf.mean()), "cluster_cand_mean": float(cluster_cand.mean()), "cluster_seed_mean": float(cluster_seed.mean()), "cluster_sbn_mean": float(cluster_sb.mean()),
+            "direct_support_mean": float(direct.mean()), "group_support_mean": float(group.mean()),
+            "raw_reliability_mean": float(raw_reliability.mean()), "raw_reliability_std": float(raw_reliability.std(unbiased=False)), "raw_reliability_min": float(raw_reliability.min()), "raw_reliability_max": float(raw_reliability.max()), "gate_formula_error_abs_max": formula_error, "empty_hypergraph_fallback": not bool(valid.any()),
+            "hg_gate_mean": float(gate.mean()), "hg_gate_std": float(gate.std(unbiased=False)), "hg_gate_min": float(gate.min()), "hg_gate_max": float(gate.max()),
+            "delta_base_abs_mean": float(delta_cluster.abs().mean()), "delta_final_abs_mean": float(final.abs().mean()), "delta_change_abs_mean": float((final-delta_cluster).abs().mean()),
+            "positive_delta_clusters": int(pos.sum()), "negative_delta_clusters": int(neg.sum()),
+            "positive_delta_abs_before": mean_if(delta_cluster,pos), "positive_delta_abs_after": mean_if(final,pos), "negative_delta_abs_before": mean_if(delta_cluster,neg), "negative_delta_abs_after": mean_if(final,neg),
+            "correction_retention_ratio": 1.0 if float(base_sum) <= 1e-8 else float(final.abs().sum()/base_sum),
+            "sign_flip_count": int(((torch.sign(delta_cluster)!=torch.sign(final)) & (delta_cluster!=0) & (final!=0)).sum()),
+            "multi_evidence_cluster_fraction": float(((H>0).sum(1)>=2).float().mean()),
+            "positive_retention_ratio": pos_ret, "negative_retention_ratio": neg_ret,
+            "positive_delta_change_abs_mean": float((final[pos]-delta_cluster[pos]).abs().mean()) if bool(pos.any()) else 0.0,
+            "negative_delta_change_abs_mean": float((final[neg]-delta_cluster[neg]).abs().mean()) if bool(neg.any()) else 0.0,
+            "num_positive_gated_clusters": int(pos.sum()), "num_negative_gated_clusters": int(neg.sum()),
+        }
+        return final[labels_t].view(h_t, w_t)
 
     def _part4_semantic_consistency_correction(
         self,
@@ -858,6 +900,6 @@ class FoRIS(nn.Module):
         penalty = self._semantic_disagreement_penalty(sf, sbn, cand_soft, seed_prior)
         score = score - penalty
         score = score 
-        delta_map = self._semantic_cluster_reweight_map(tgt_feat, sf, sbn)
+        delta_map = self._semantic_cluster_reweight_map(tgt_feat, sf, sbn, cand_soft, seed_prior)
         return score + delta_map
 

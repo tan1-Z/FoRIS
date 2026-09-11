@@ -326,11 +326,24 @@ class FoRIS(nn.Module):
         )
 
         confidence = (2.0 * score_norm - 1.0).abs().clamp(0.0, 1.0)
-        score_norm_p1 = confidence * score_norm + (1.0 - confidence) * neighbor_mean
+        score_norm_symmetric = confidence * score_norm + (1.0 - confidence) * neighbor_mean
+        score_norm_p1 = torch.minimum(score_norm, score_norm_symmetric)
         score_p1 = score_raw if bool(score_range <= 1e-6) else score_min + score_range * score_norm_p1
 
         conductance = torch.cat([c_lr.reshape(-1), c_ud.reshape(-1)])
+        upward_candidate = score_norm_symmetric > score_norm
+        downward_candidate = score_norm_symmetric < score_norm
+        rejected_upward = (score_norm_symmetric - score_norm).clamp_min(0.0)
+        accepted_dissipation = (score_norm - score_norm_p1).clamp_min(0.0)
+        before_patch = score_norm > 0.5
+        after_patch = score_norm_p1 > 0.5
+        patch_fg_to_bg = before_patch & (~after_patch)
+        patch_bg_to_fg = (~before_patch) & after_patch
+        monotonicity_violation = score_norm_p1 > score_norm + 1e-7
+        if bool(patch_bg_to_fg.any()):
+            raise RuntimeError("P1.2 monotonicity violation: patch BG->FG flip detected.")
         self.last_p1_diffusion_analysis = {
+            "mode": "p1_2_one_sided_dissipative",
             "raw_score_min": float(score_min),
             "raw_score_max": float(score_max),
             "raw_score_range": float(score_range),
@@ -351,13 +364,26 @@ class FoRIS(nn.Module):
             "sigma_feat": float(sigma_feat),
             "sigma_rgb": float(sigma_rgb),
             "neighbor_mean_minus_score_abs_mean": float((neighbor_mean - score_norm).abs().mean()),
-            "patch_threshold_flip_count": int(((score_norm > 0.5) != (score_norm_p1 > 0.5)).sum()),
-            "patch_threshold_flip_fraction": float(((score_norm > 0.5) != (score_norm_p1 > 0.5)).float().mean()),
-            "threshold_flip_count": int(((score_norm > 0.5) != (score_norm_p1 > 0.5)).sum()),
-            "threshold_flip_fraction": float(((score_norm > 0.5) != (score_norm_p1 > 0.5)).float().mean()),
+            "patch_threshold_flip_count": int((before_patch != after_patch).sum()),
+            "patch_threshold_flip_fraction": float((before_patch != after_patch).float().mean()),
+            "threshold_flip_count": int((before_patch != after_patch).sum()),
+            "threshold_flip_fraction": float((before_patch != after_patch).float().mean()),
             "low_conf_fraction": float((confidence < 0.5).float().mean()),
             "anchor_min_error": float(score_norm_p1.reshape(-1)[score_raw.argmin()].abs()),
             "anchor_max_error": float((score_norm_p1.reshape(-1)[score_raw.argmax()] - 1.0).abs()),
+            "upward_candidate_fraction": float(upward_candidate.float().mean()),
+            "downward_candidate_fraction": float(downward_candidate.float().mean()),
+            "unchanged_candidate_fraction": float((~(upward_candidate | downward_candidate)).float().mean()),
+            "upward_candidate_abs_mean": float(rejected_upward.mean()),
+            "downward_candidate_abs_mean": float((score_norm - score_norm_symmetric).clamp_min(0.0).mean()),
+            "rejected_upward_abs_mean": float(rejected_upward.mean()),
+            "rejected_upward_abs_max": float(rejected_upward.max()),
+            "accepted_dissipation_mean": float(accepted_dissipation.mean()),
+            "accepted_dissipation_max": float(accepted_dissipation.max()),
+            "patch_fg_to_bg_count": int(patch_fg_to_bg.sum()),
+            "patch_bg_to_fg_count": int(patch_bg_to_fg.sum()),
+            "monotonicity_violation_count": int(monotonicity_violation.sum()),
+            "monotonicity_violation_max": float((score_norm_p1 - score_norm).clamp_min(0.0).max()),
         }
         return score_p1.squeeze(0) if score_part4.ndim == 2 else score_p1
 

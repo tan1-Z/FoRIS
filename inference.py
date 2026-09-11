@@ -61,6 +61,35 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
     meter = AverageMeter(args.dataset, list(ds.class_ids))
     meter_before = AverageMeter(args.dataset, list(ds.class_ids))
     component_records = []
+    signal_names = ("sf", "sbn", "semantic_margin", "cand_soft", "seed_prior", "candidate_seed_support", "fg_support_mean", "fg_vs_bg_margin", "score_norm", "confidence", "neighbor_mean_norm", "dissipation_gap", "distance_to_threshold")
+    pooled_signals = {key: {"corrective": [], "harmful": [], "episode_diffs": []} for key in signal_names}
+
+    def distribution(values):
+        if values.numel() == 0:
+            return {"count": 0, "mean": None, "std": None, "median": None, "p10": None, "p25": None, "p50": None, "p75": None, "p90": None}
+        values = values.detach().float().cpu()
+        return {"count": int(values.numel()), "mean": float(values.mean()), "std": float(values.std(unbiased=False)), "median": float(values.median()), "p10": float(torch.quantile(values, .10)), "p25": float(torch.quantile(values, .25)), "p50": float(torch.quantile(values, .50)), "p75": float(torch.quantile(values, .75)), "p90": float(torch.quantile(values, .90))}
+
+    def patch_attribution(state, gt):
+        score_norm = state["score_norm"].squeeze()
+        score_norm_p1 = state["score_norm_p1"].squeeze()
+        gt_patch = F.interpolate(gt[None, None].float(), size=score_norm.shape, mode="nearest")[0, 0] > .5
+        removed = (score_norm > .5) & ~(score_norm_p1 > .5)
+        corrective, harmful = removed & ~gt_patch, removed & gt_patch
+        sf, sbn, cand, seed = (state[key].squeeze() for key in ("sf", "sbn", "cand_soft", "seed_prior"))
+        signals = {"sf": sf, "sbn": sbn, "semantic_margin": sf - sbn, "cand_soft": cand, "seed_prior": seed, "candidate_seed_support": .5 * (cand + seed), "fg_support_mean": (sf + cand + seed) / 3., "score_norm": score_norm, "confidence": state["confidence"].squeeze(), "neighbor_mean_norm": state["neighbor_mean_norm"].squeeze(), "dissipation_gap": (score_norm - state["neighbor_mean_norm"].squeeze()).clamp_min(0.), "distance_to_threshold": (score_norm - .5).abs()}
+        signals["fg_vs_bg_margin"] = signals["fg_support_mean"] - sbn
+        result = {"removed_patch_count": int(removed.sum()), "corrective_removed_patch_count": int(corrective.sum()), "harmful_removed_patch_count": int(harmful.sum()), "signals": {}}
+        for key, values in signals.items():
+            c, h = values[corrective], values[harmful]
+            c_stats, h_stats = distribution(c), distribution(h)
+            result["signals"][key] = {"corrective": c_stats, "harmful": h_stats}
+            if c.numel() and h.numel():
+                c_np, h_np = c.detach().float().cpu().numpy(), h.detach().float().cpu().numpy()
+                pooled_signals[key]["corrective"].append(c_np)
+                pooled_signals[key]["harmful"].append(h_np)
+                pooled_signals[key]["episode_diffs"].append(float(h.mean() - c.mean()))
+        return result
 
     # ──────── Evaluation loop ────────
     pbar = tqdm(loader, ncols=80)
@@ -131,10 +160,13 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
         counterfactual = {"iou_before": float(before_iou), "iou_after": float(episode_iou), "delta_iou": float(episode_iou - before_iou), "flip_count": flip_count, "flip_fraction": float(flip_count / max(1, valid_count)), "fg_to_bg_count": fg_to_bg_count, "bg_to_fg_count": bg_to_fg_count, "fg_to_bg_fraction": float(fg_to_bg_count / max(1, valid_count)), "bg_to_fg_fraction": float(bg_to_fg_count / max(1, valid_count)), "corrective_flip_count": corrective_flip_count, "harmful_flip_count": harmful_flip_count, "corrective_flip_fraction": float(corrective_flip_count / max(1, flip_count)), "harmful_flip_fraction": float(harmful_flip_count / max(1, flip_count)), "net_corrective_flips": corrective_flip_count - harmful_flip_count, "corrective_bg_to_fg": corrective_bg_to_fg, "harmful_bg_to_fg": harmful_bg_to_fg, "corrective_fg_to_bg": corrective_fg_to_bg, "harmful_fg_to_bg": harmful_fg_to_bg}
         analysis = getattr(model, "last_hg_part4_analysis", None)
         p1_analysis = getattr(model, "last_p1_diffusion_analysis", None)
+        attribution_state = getattr(model, "last_p1_patch_attribution_state", None)
+        attribution = patch_attribution(attribution_state, tgt_mask) if attribution_state is not None else None
         if analysis is not None:
             component_records.append({"episode_index": int(idx), "class_id": int(class_id[0].item()),
                                       "num_shots": int(len(ref_imgs)), "episode_iou": float(episode_iou), "hg": analysis,
-                                      "p1_diffusion": p1_analysis, "p1_1_counterfactual": counterfactual})
+                                      "p1_diffusion": p1_analysis, "p1_1_counterfactual": counterfactual,
+                                      "p1_2_flip_attribution": attribution})
         # save_episode_visualizations(
         #     reference_image=ref_imgs[0],
         #     reference_mask=ref_masks[0],
@@ -200,6 +232,38 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
     total_corrective_bg_to_fg = int(sum(r["corrective_bg_to_fg"] for r in cf_records))
     total_harmful_bg_to_fg = int(sum(r["harmful_bg_to_fg"] for r in cf_records))
     summary["p1_2_summary"]={"mode":"p1_2_one_sided_dissipative","miou_before_same_run":float(miou_before),"miou_after":float(miou),"miou_delta_same_run":float(miou-miou_before),"delta_iou_mean":cf_avg("delta_iou"),"delta_iou_median":cf_percentile(50),"improved_episode_fraction":float(np.mean([r["delta_iou"] > 1e-8 for r in cf_records])) if cf_records else None,"declined_episode_fraction":float(np.mean([r["delta_iou"] < -1e-8 for r in cf_records])) if cf_records else None,"unchanged_episode_fraction":float(np.mean([abs(r["delta_iou"]) <= 1e-8 for r in cf_records])) if cf_records else None,"upward_candidate_fraction_mean":p1_avg("upward_candidate_fraction"),"downward_candidate_fraction_mean":p1_avg("downward_candidate_fraction"),"rejected_upward_abs_mean":p1_avg("rejected_upward_abs_mean"),"accepted_dissipation_mean":p1_avg("accepted_dissipation_mean"),"patch_bg_to_fg_count_total":p1_sum("patch_bg_to_fg_count"),"patch_fg_to_bg_count_total":p1_sum("patch_fg_to_bg_count"),"final_bg_to_fg_count_total":int(sum(r["bg_to_fg_count"] for r in cf_records)),"final_fg_to_bg_count_total":int(sum(r["fg_to_bg_count"] for r in cf_records)),"fg_to_bg_corrective_fraction_pooled":float(total_corrective_fg_to_bg / max(1, total_corrective_fg_to_bg + total_harmful_fg_to_bg)),"bg_to_fg_corrective_fraction_pooled":float(total_corrective_bg_to_fg / max(1, total_corrective_bg_to_fg + total_harmful_bg_to_fg)),"corr_delta_iou_vs_accepted_dissipation":cf_correlation("accepted_dissipation_mean"),"corr_delta_iou_vs_fg_to_bg_flip_fraction":cf_self_correlation("fg_to_bg_fraction")}
+    def rank_auc(corrective, harmful):
+        if corrective.size == 0 or harmful.size == 0:
+            return None
+        values = np.concatenate([corrective, harmful])
+        labels = np.concatenate([np.zeros(corrective.size, dtype=bool), np.ones(harmful.size, dtype=bool)])
+        order = np.argsort(values, kind="mergesort")
+        ranks = np.empty(values.size, dtype=float)
+        start = 0
+        while start < values.size:
+            end = start + 1
+            while end < values.size and values[order[end]] == values[order[start]]:
+                end += 1
+            ranks[order[start:end]] = (start + end + 1) / 2.0
+            start = end
+        n_h, n_c = harmful.size, corrective.size
+        return float((ranks[labels].sum() - n_h * (n_h + 1) / 2.0) / (n_h * n_c))
+    attribution_signals, best_signal, best_auc = {}, None, None
+    for key, data in pooled_signals.items():
+        corrective = np.concatenate(data["corrective"]) if data["corrective"] else np.empty(0)
+        harmful = np.concatenate(data["harmful"]) if data["harmful"] else np.empty(0)
+        auc = rank_auc(corrective, harmful)
+        pooled_std = np.sqrt((corrective.var() + harmful.var()) / 2.0) if corrective.size > 1 and harmful.size > 1 else None
+        diffs = np.asarray(data["episode_diffs"], dtype=float)
+        attribution_signals[key] = {"auc_harmful_positive": auc, "corrective_mean": float(corrective.mean()) if corrective.size else None, "harmful_mean": float(harmful.mean()) if harmful.size else None, "mean_diff_corrective_minus_harmful": float(corrective.mean() - harmful.mean()) if corrective.size and harmful.size else None, "cohens_d": float((corrective.mean() - harmful.mean()) / (pooled_std + 1e-8)) if pooled_std is not None else None, "median_diff_harmful_minus_corrective": float(np.median(harmful) - np.median(corrective)) if corrective.size and harmful.size else None, "episode_diff_mean": float(diffs.mean()) if diffs.size else None, "episode_diff_median": float(np.median(diffs)) if diffs.size else None, "episode_diff_positive_fraction": float((diffs > 0).mean()) if diffs.size else None}
+        if auc is not None and (best_auc is None or auc > best_auc):
+            best_signal, best_auc = key, auc
+    def episode_card(record):
+        attr, cf = record["p1_2_flip_attribution"], record["p1_1_counterfactual"]
+        stats = attr["signals"]
+        return {"episode_index": record["episode_index"], "class_id": record["class_id"], "iou_before": cf["iou_before"], "iou_after": cf["iou_after"], "delta_iou": cf["delta_iou"], "removed_patch_count": attr["removed_patch_count"], "corrective_removed_patch_count": attr["corrective_removed_patch_count"], "harmful_removed_patch_count": attr["harmful_removed_patch_count"], "final_corrective_fg_to_bg": cf["corrective_fg_to_bg"], "final_harmful_fg_to_bg": cf["harmful_fg_to_bg"], "sf_harmful_mean": stats["sf"]["harmful"]["mean"], "sbn_harmful_mean": stats["sbn"]["harmful"]["mean"], "cand_harmful_mean": stats["cand_soft"]["harmful"]["mean"], "seed_harmful_mean": stats["seed_prior"]["harmful"]["mean"], "semantic_margin_harmful_mean": stats["semantic_margin"]["harmful"]["mean"], "fg_support_harmful_mean": stats["fg_support_mean"]["harmful"]["mean"], "dissipation_gap_harmful_mean": stats["dissipation_gap"]["harmful"]["mean"]}
+    ranked_records = [r for r in component_records if r["p1_2_flip_attribution"] is not None]
+    summary["p1_2_flip_attribution_summary"]={"num_episodes":len(ranked_records),"positive_class":"harmful_removed_patch","auc_interpretation":"AUC > 0.5 means higher signal values are more associated with a harmful removal.","pooled_corrective_removed_patch_count":int(sum(r["p1_2_flip_attribution"]["corrective_removed_patch_count"] for r in ranked_records)),"pooled_harmful_removed_patch_count":int(sum(r["p1_2_flip_attribution"]["harmful_removed_patch_count"] for r in ranked_records)),"pooled_corrective_final_fg_to_bg":total_corrective_fg_to_bg,"pooled_harmful_final_fg_to_bg":total_harmful_fg_to_bg,"signals":attribution_signals,"best_auc_signal":best_signal,"best_auc_value":best_auc,"top_harmful_episodes":[episode_card(r) for r in sorted(ranked_records,key=lambda r:r["p1_1_counterfactual"]["delta_iou"])[:20]],"top_beneficial_episodes":[episode_card(r) for r in sorted(ranked_records,key=lambda r:r["p1_1_counterfactual"]["delta_iou"],reverse=True)[:20]]}
     payload={"component":{"name":"part4_evidence_consistency_hypergraph_gate","mode":"original_symmetric_hg_gate","description":"Part-4 cluster corrections are symmetrically attenuated by an evidence-consistency hypergraph gate.","gate_formula":"gate = 0.5 + 0.5 * raw_reliability","hyperedges":["sf_foreground_support","candidate_support","seed_prior_support"],"gate_range":[.5,1.]},"run":{"dataset":str(args.dataset),"exp_name":str(args.exp_name),"seed":int(args.seed),"num_episodes":len(component_records),"output_dir":str(args.output_dir)},"summary":summary,"episodes":component_records}
     analysis_path=join(args.output_dir,"hg_part4_component_analysis.json")
     with open(analysis_path,"w",encoding="utf-8") as fp: json.dump(payload,fp,indent=2,ensure_ascii=False)

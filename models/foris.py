@@ -100,6 +100,7 @@ class FoRIS(nn.Module):
         self.last_hg_part4_analysis = None
         self.last_p1_diffusion_analysis = None
         self.last_p1_before_mask = None
+        self.last_p1_patch_attribution_state = None
 
     # ──────────────────────── Public API ────────────────────────
 
@@ -230,6 +231,10 @@ class FoRIS(nn.Module):
             target_feat=tgt_feat_denoised,
             target_rgb=tgt_image,
         )
+        self.last_p1_patch_attribution_state.update({
+            "sf": sf.detach(), "sbn": sbn.detach(), "cand_soft": cand_soft.detach(),
+            "seed_prior": seed_prior.detach(),
+        })
         before_mask = self._binarize_response(
             score_before_p1,
             target_hw=(tgt_image.shape[-2], tgt_image.shape[-1]),
@@ -384,6 +389,10 @@ class FoRIS(nn.Module):
             "patch_bg_to_fg_count": int(patch_bg_to_fg.sum()),
             "monotonicity_violation_count": int(monotonicity_violation.sum()),
             "monotonicity_violation_max": float((score_norm_p1 - score_norm).clamp_min(0.0).max()),
+        }
+        self.last_p1_patch_attribution_state = {
+            "score_norm": score_norm.detach(), "score_norm_p1": score_norm_p1.detach(),
+            "confidence": confidence.detach(), "neighbor_mean_norm": neighbor_mean.detach(),
         }
         return score_p1.squeeze(0) if score_part4.ndim == 2 else score_p1
 

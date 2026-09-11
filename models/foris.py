@@ -99,6 +99,7 @@ class FoRIS(nn.Module):
         self.should_debiass = True
         self.last_hg_part4_analysis = None
         self.last_p1_diffusion_analysis = None
+        self.last_p1_before_mask = None
 
     # ──────────────────────── Public API ────────────────────────
 
@@ -223,11 +224,17 @@ class FoRIS(nn.Module):
             seed_prior=seed_prior,
             tgt_feat=tgt_feat_denoised,
         )
+        score_before_p1 = score.clone()
         score = self._p1_uncertainty_gated_anisotropic_diffusion(
             score,
             target_feat=tgt_feat_denoised,
             target_rgb=tgt_image,
         )
+        before_mask = self._binarize_response(
+            score_before_p1,
+            target_hw=(tgt_image.shape[-2], tgt_image.shape[-1]),
+        )
+        self.last_p1_before_mask = self._finalize_mask(before_mask, tgt_image)
 
         denoised_mask = self._binarize_response(
             score,
@@ -282,8 +289,11 @@ class FoRIS(nn.Module):
         target_rgb: torch.Tensor,
     ) -> torch.Tensor:
         """One 4-neighbor, uncertainty-gated anisotropic diffusion step."""
-        score = score_part4.unsqueeze(0) if score_part4.ndim == 2 else score_part4
-        _, h, w = score.shape
+        score_raw = score_part4.unsqueeze(0) if score_part4.ndim == 2 else score_part4
+        _, h, w = score_raw.shape
+        score_min, score_max = score_raw.amin(), score_raw.amax()
+        score_range = score_max - score_min
+        score_norm = (score_raw - score_min) / score_range.clamp_min(1e-6)
         feat = F.normalize(target_feat, p=2, dim=1)
         rgb = F.interpolate(
             denormalize(target_rgb).clamp(0.0, 1.0),
@@ -299,47 +309,55 @@ class FoRIS(nn.Module):
         c_lr = torch.exp(-d_feat_lr / sigma_feat - d_rgb_lr / sigma_rgb)
         c_ud = torch.exp(-d_feat_ud / sigma_feat - d_rgb_ud / sigma_rgb)
 
-        weighted_neighbor_sum = torch.zeros_like(score)
-        conductance_sum = torch.zeros_like(score)
-        weighted_neighbor_sum[:, :, :-1] += c_lr * score[:, :, 1:]
-        weighted_neighbor_sum[:, :, 1:] += c_lr * score[:, :, :-1]
+        weighted_neighbor_sum = torch.zeros_like(score_norm)
+        conductance_sum = torch.zeros_like(score_norm)
+        weighted_neighbor_sum[:, :, :-1] += c_lr * score_norm[:, :, 1:]
+        weighted_neighbor_sum[:, :, 1:] += c_lr * score_norm[:, :, :-1]
         conductance_sum[:, :, :-1] += c_lr
         conductance_sum[:, :, 1:] += c_lr
-        weighted_neighbor_sum[:, :-1, :] += c_ud * score[:, 1:, :]
-        weighted_neighbor_sum[:, 1:, :] += c_ud * score[:, :-1, :]
+        weighted_neighbor_sum[:, :-1, :] += c_ud * score_norm[:, 1:, :]
+        weighted_neighbor_sum[:, 1:, :] += c_ud * score_norm[:, :-1, :]
         conductance_sum[:, :-1, :] += c_ud
         conductance_sum[:, 1:, :] += c_ud
         neighbor_mean = torch.where(
             conductance_sum > 1e-8,
             weighted_neighbor_sum / conductance_sum.clamp_min(1e-8),
-            score,
+            score_norm,
         )
 
-        confidence = (2.0 * score - 1.0).abs().clamp(0.0, 1.0)
-        score_p1 = confidence * score + (1.0 - confidence) * neighbor_mean
-        input_in_unit_interval = bool((score.min() >= 0.0) and (score.max() <= 1.0))
-        if input_in_unit_interval:
-            score_p1 = score_p1.clamp(0.0, 1.0)
-
-        def normalized_threshold(x: torch.Tensor) -> torch.Tensor:
-            x = x - x.amin(dim=(-2, -1), keepdim=True)
-            return x / x.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-6) > 0.5
+        confidence = (2.0 * score_norm - 1.0).abs().clamp(0.0, 1.0)
+        score_norm_p1 = confidence * score_norm + (1.0 - confidence) * neighbor_mean
+        score_p1 = score_raw if bool(score_range <= 1e-6) else score_min + score_range * score_norm_p1
 
         conductance = torch.cat([c_lr.reshape(-1), c_ud.reshape(-1)])
         self.last_p1_diffusion_analysis = {
-            "score_before_mean": float(score.mean()),
+            "raw_score_min": float(score_min),
+            "raw_score_max": float(score_max),
+            "raw_score_range": float(score_range),
+            "normalized_score_mean": float(score_norm.mean()),
+            "normalized_confidence_mean": float(confidence.mean()),
+            "normalized_low_conf_fraction": float((confidence < 0.5).float().mean()),
+            "score_norm_change_abs_mean": float((score_norm_p1 - score_norm).abs().mean()),
+            "score_norm_change_abs_max": float((score_norm_p1 - score_norm).abs().max()),
+            "raw_score_change_abs_mean": float((score_p1 - score_raw).abs().mean()),
+            "raw_score_change_abs_max": float((score_p1 - score_raw).abs().max()),
+            "score_before_mean": float(score_raw.mean()),
             "score_after_mean": float(score_p1.mean()),
-            "score_change_abs_mean": float((score_p1 - score).abs().mean()),
-            "score_change_abs_max": float((score_p1 - score).abs().max()),
+            "score_change_abs_mean": float((score_p1 - score_raw).abs().mean()),
+            "score_change_abs_max": float((score_p1 - score_raw).abs().max()),
             "confidence_mean": float(confidence.mean()),
             "conductance_mean": float(conductance.mean()),
             "conductance_std": float(conductance.std(unbiased=False)),
             "sigma_feat": float(sigma_feat),
             "sigma_rgb": float(sigma_rgb),
-            "neighbor_mean_minus_score_abs_mean": float((neighbor_mean - score).abs().mean()),
-            "threshold_flip_count": int((normalized_threshold(score) != normalized_threshold(score_p1)).sum()),
-            "threshold_flip_fraction": float((normalized_threshold(score) != normalized_threshold(score_p1)).float().mean()),
+            "neighbor_mean_minus_score_abs_mean": float((neighbor_mean - score_norm).abs().mean()),
+            "patch_threshold_flip_count": int(((score_norm > 0.5) != (score_norm_p1 > 0.5)).sum()),
+            "patch_threshold_flip_fraction": float(((score_norm > 0.5) != (score_norm_p1 > 0.5)).float().mean()),
+            "threshold_flip_count": int(((score_norm > 0.5) != (score_norm_p1 > 0.5)).sum()),
+            "threshold_flip_fraction": float(((score_norm > 0.5) != (score_norm_p1 > 0.5)).float().mean()),
             "low_conf_fraction": float((confidence < 0.5).float().mean()),
+            "anchor_min_error": float(score_norm_p1.reshape(-1)[score_raw.argmin()].abs()),
+            "anchor_max_error": float((score_norm_p1.reshape(-1)[score_raw.argmax()] - 1.0).abs()),
         }
         return score_p1.squeeze(0) if score_part4.ndim == 2 else score_p1
 

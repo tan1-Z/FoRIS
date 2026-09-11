@@ -59,6 +59,7 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
     # Original FoRIS metrics implementations differ on whether ``device`` is
     # accepted; their default CUDA buffers match the supported GPU workflow.
     meter = AverageMeter(args.dataset, list(ds.class_ids))
+    meter_before = AverageMeter(args.dataset, list(ds.class_ids))
     component_records = []
 
     # ──────── Evaluation loop ────────
@@ -103,14 +104,36 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
         class_id = torch.as_tensor(batch['class_id'], device=args.device).reshape(-1)
         meter.update(area_inter, area_union, class_id)
 
+        before_mask = getattr(model, "last_p1_before_mask", None)
+        if before_mask is None:
+            raise RuntimeError("P1.1 counterfactual mask was not produced.")
+        before_inter, before_union = Evaluator.classify_prediction(
+            before_mask, tgt_mask, tgt_ignore_idx=tgt_ignore_idx,
+        )
+        meter_before.update(before_inter, before_union, class_id)
+
         fg_union = area_union[1].clamp_min(1.0)
         episode_iou = (area_inter[1] / fg_union * 100.0).item()
+        before_iou = (before_inter[1] / before_union[1].clamp_min(1.0) * 100.0).item()
+        before_fg, after_fg = before_mask.bool(), pred_mask.bool()
+        valid = torch.ones_like(after_fg, dtype=torch.bool) if tgt_ignore_idx is None else ~tgt_ignore_idx
+        bg_to_fg = (~before_fg) & after_fg & valid
+        fg_to_bg = before_fg & (~after_fg) & valid
+        corrective_bg_to_fg = int((bg_to_fg & tgt_mask).sum())
+        harmful_bg_to_fg = int((bg_to_fg & (~tgt_mask)).sum())
+        corrective_fg_to_bg = int((fg_to_bg & (~tgt_mask)).sum())
+        harmful_fg_to_bg = int((fg_to_bg & tgt_mask).sum())
+        flip_count = int((bg_to_fg | fg_to_bg).sum())
+        valid_count = int(valid.sum())
+        corrective_flip_count = corrective_bg_to_fg + corrective_fg_to_bg
+        harmful_flip_count = harmful_bg_to_fg + harmful_fg_to_bg
+        counterfactual = {"iou_before": float(before_iou), "iou_after": float(episode_iou), "delta_iou": float(episode_iou - before_iou), "flip_count": flip_count, "flip_fraction": float(flip_count / max(1, valid_count)), "fg_to_bg_count": int(fg_to_bg.sum()), "bg_to_fg_count": int(bg_to_fg.sum()), "corrective_flip_count": corrective_flip_count, "harmful_flip_count": harmful_flip_count, "corrective_flip_fraction": float(corrective_flip_count / max(1, flip_count)), "harmful_flip_fraction": float(harmful_flip_count / max(1, flip_count)), "net_corrective_flips": corrective_flip_count - harmful_flip_count, "corrective_bg_to_fg": corrective_bg_to_fg, "harmful_bg_to_fg": harmful_bg_to_fg, "corrective_fg_to_bg": corrective_fg_to_bg, "harmful_fg_to_bg": harmful_fg_to_bg}
         analysis = getattr(model, "last_hg_part4_analysis", None)
         p1_analysis = getattr(model, "last_p1_diffusion_analysis", None)
         if analysis is not None:
             component_records.append({"episode_index": int(idx), "class_id": int(class_id[0].item()),
                                       "num_shots": int(len(ref_imgs)), "episode_iou": float(episode_iou), "hg": analysis,
-                                      "p1_diffusion": p1_analysis})
+                                      "p1_diffusion": p1_analysis, "p1_1_counterfactual": counterfactual})
         # save_episode_visualizations(
         #     reference_image=ref_imgs[0],
         #     reference_mask=ref_masks[0],
@@ -129,7 +152,8 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
 
     # ──────── Final results ────────
     miou = meter.compute_iou()[0].item()
-    out_str = f'mIoU = {miou:.1f}'
+    miou_before = meter_before.compute_iou()[0].item()
+    out_str = f'mIoU after P1.1 = {miou:.1f}; same-run before P1.1 = {miou_before:.1f}; delta = {miou - miou_before:.3f}'
     print(out_str)
     with open(log_file, 'a') as fp:
         fp.write(out_str + '\n')
@@ -149,8 +173,20 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
             return None
         x, y = np.asarray(xs, dtype=float).T
         return float(np.corrcoef(x, y)[0, 1]) if np.isfinite(x).all() and np.isfinite(y).all() and x.std()>1e-12 and y.std()>1e-12 else None
-    summary={"mode":"original_symmetric_hg_gate","num_episodes":len(component_records),"miou":float(miou),"hg_gate_mean":avg("hg_gate_mean"),"raw_reliability_mean":avg("raw_reliability_mean"),"negative_retention_ratio_mean":avg("negative_retention_ratio"),"positive_retention_ratio_mean":avg("positive_retention_ratio"),"empty_hypergraph_fallback_count":int(sum(r["hg"]["empty_hypergraph_fallback"] for r in component_records)),"gate_formula_error_abs_max":max([r["hg"]["gate_formula_error_abs_max"] for r in component_records],default=None),"correction_retention_ratio_mean":avg("correction_retention_ratio"),"sign_flip_count_total":int(sum(r["hg"]["sign_flip_count"] for r in component_records)),"corr_episode_iou_vs_negative_retention":correlation("negative_retention_ratio")}
+    cf_records = [r["p1_1_counterfactual"] for r in component_records]
+    def cf_avg(key):
+        return float(np.mean([r[key] for r in cf_records])) if cf_records else None
+    def cf_percentile(percentile):
+        return float(np.percentile([r["delta_iou"] for r in cf_records], percentile)) if cf_records else None
+    def cf_correlation(key, *, absolute_delta=False):
+        if len(component_records) < 2:
+            return None
+        x = np.array([abs(r["p1_1_counterfactual"]["delta_iou"]) if absolute_delta else r["p1_1_counterfactual"]["delta_iou"] for r in component_records])
+        y = np.array([r["p1_diffusion"][key] for r in component_records])
+        return float(np.corrcoef(x, y)[0, 1]) if np.isfinite(x).all() and np.isfinite(y).all() and x.std()>1e-12 and y.std()>1e-12 else None
+    summary={"mode":"original_symmetric_hg_gate","num_episodes":len(component_records),"miou":float(miou),"miou_before_same_run":float(miou_before),"miou_delta_same_run":float(miou-miou_before),"hg_gate_mean":avg("hg_gate_mean"),"raw_reliability_mean":avg("raw_reliability_mean"),"negative_retention_ratio_mean":avg("negative_retention_ratio"),"positive_retention_ratio_mean":avg("positive_retention_ratio"),"empty_hypergraph_fallback_count":int(sum(r["hg"]["empty_hypergraph_fallback"] for r in component_records)),"gate_formula_error_abs_max":max([r["hg"]["gate_formula_error_abs_max"] for r in component_records],default=None),"correction_retention_ratio_mean":avg("correction_retention_ratio"),"sign_flip_count_total":int(sum(r["hg"]["sign_flip_count"] for r in component_records)),"corr_episode_iou_vs_negative_retention":correlation("negative_retention_ratio")}
     summary["p1_diffusion_summary"]={"score_change_abs_mean":p1_avg("score_change_abs_mean"),"confidence_mean":p1_avg("confidence_mean"),"conductance_mean":p1_avg("conductance_mean"),"sigma_feat_mean":p1_avg("sigma_feat"),"sigma_rgb_mean":p1_avg("sigma_rgb"),"threshold_flip_fraction_mean":p1_avg("threshold_flip_fraction"),"corr_episode_iou_vs_score_change_abs_mean":p1_correlation("score_change_abs_mean"),"corr_episode_iou_vs_threshold_flip_fraction":p1_correlation("threshold_flip_fraction"),"corr_episode_iou_vs_low_conf_fraction":p1_correlation("low_conf_fraction")}
+    summary["p1_1_summary"]={"delta_iou_mean":cf_avg("delta_iou"),"delta_iou_median":cf_percentile(50),"improved_episode_fraction":float(np.mean([r["delta_iou"] > 1e-8 for r in cf_records])) if cf_records else None,"declined_episode_fraction":float(np.mean([r["delta_iou"] < -1e-8 for r in cf_records])) if cf_records else None,"unchanged_episode_fraction":float(np.mean([abs(r["delta_iou"]) <= 1e-8 for r in cf_records])) if cf_records else None,"delta_iou_p01":cf_percentile(1),"delta_iou_p05":cf_percentile(5),"delta_iou_p25":cf_percentile(25),"delta_iou_p50":cf_percentile(50),"delta_iou_p75":cf_percentile(75),"delta_iou_p95":cf_percentile(95),"delta_iou_p99":cf_percentile(99),"delta_iou_min":cf_percentile(0),"delta_iou_max":cf_percentile(100),"corrective_flip_fraction_mean":cf_avg("corrective_flip_fraction"),"harmful_flip_fraction_mean":cf_avg("harmful_flip_fraction"),"corr_delta_iou_vs_patch_flip_fraction":cf_correlation("patch_threshold_flip_fraction"),"corr_abs_delta_iou_vs_patch_flip_fraction":cf_correlation("patch_threshold_flip_fraction",absolute_delta=True),"corr_delta_iou_vs_low_conf_fraction":cf_correlation("normalized_low_conf_fraction"),"corr_delta_iou_vs_raw_score_range":cf_correlation("raw_score_range")}
     payload={"component":{"name":"part4_evidence_consistency_hypergraph_gate","mode":"original_symmetric_hg_gate","description":"Part-4 cluster corrections are symmetrically attenuated by an evidence-consistency hypergraph gate.","gate_formula":"gate = 0.5 + 0.5 * raw_reliability","hyperedges":["sf_foreground_support","candidate_support","seed_prior_support"],"gate_range":[.5,1.]},"run":{"dataset":str(args.dataset),"exp_name":str(args.exp_name),"seed":int(args.seed),"num_episodes":len(component_records),"output_dir":str(args.output_dir)},"summary":summary,"episodes":component_records}
     analysis_path=join(args.output_dir,"hg_part4_component_analysis.json")
     with open(analysis_path,"w",encoding="utf-8") as fp: json.dump(payload,fp,indent=2,ensure_ascii=False)

@@ -98,7 +98,7 @@ class FoRIS(nn.Module):
 
         self.should_debiass = True
         self.last_hg_part4_analysis = None
-        self.last_b1_bg_analysis = None
+        self.last_p1_diffusion_analysis = None
 
     # ──────────────────────── Public API ────────────────────────
 
@@ -223,6 +223,11 @@ class FoRIS(nn.Module):
             seed_prior=seed_prior,
             tgt_feat=tgt_feat_denoised,
         )
+        score = self._p1_uncertainty_gated_anisotropic_diffusion(
+            score,
+            target_feat=tgt_feat_denoised,
+            target_rgb=tgt_image,
+        )
 
         denoised_mask = self._binarize_response(
             score,
@@ -268,6 +273,75 @@ class FoRIS(nn.Module):
         if self.resize_to_orig_size:
             up = upsample_mask(up, self._orig_tgt_size[0], self._orig_tgt_size[1])
         return up
+
+    def _p1_uncertainty_gated_anisotropic_diffusion(
+        self,
+        score_part4: torch.Tensor,
+        *,
+        target_feat: torch.Tensor,
+        target_rgb: torch.Tensor,
+    ) -> torch.Tensor:
+        """One 4-neighbor, uncertainty-gated anisotropic diffusion step."""
+        score = score_part4.unsqueeze(0) if score_part4.ndim == 2 else score_part4
+        _, h, w = score.shape
+        feat = F.normalize(target_feat, p=2, dim=1)
+        rgb = F.interpolate(
+            denormalize(target_rgb).clamp(0.0, 1.0),
+            size=(h, w), mode="bilinear", align_corners=False,
+        )
+
+        d_feat_lr = (1.0 - (feat[:, :, :, :-1] * feat[:, :, :, 1:]).sum(dim=1)).clamp_min(0.0)
+        d_feat_ud = (1.0 - (feat[:, :, :-1, :] * feat[:, :, 1:, :]).sum(dim=1)).clamp_min(0.0)
+        d_rgb_lr = (rgb[:, :, :, :-1] - rgb[:, :, :, 1:]).pow(2).sum(dim=1)
+        d_rgb_ud = (rgb[:, :, :-1, :] - rgb[:, :, 1:, :]).pow(2).sum(dim=1)
+        sigma_feat = torch.cat([d_feat_lr.reshape(-1), d_feat_ud.reshape(-1)]).median().clamp_min(1e-6)
+        sigma_rgb = torch.cat([d_rgb_lr.reshape(-1), d_rgb_ud.reshape(-1)]).median().clamp_min(1e-6)
+        c_lr = torch.exp(-d_feat_lr / sigma_feat - d_rgb_lr / sigma_rgb)
+        c_ud = torch.exp(-d_feat_ud / sigma_feat - d_rgb_ud / sigma_rgb)
+
+        weighted_neighbor_sum = torch.zeros_like(score)
+        conductance_sum = torch.zeros_like(score)
+        weighted_neighbor_sum[:, :, :-1] += c_lr * score[:, :, 1:]
+        weighted_neighbor_sum[:, :, 1:] += c_lr * score[:, :, :-1]
+        conductance_sum[:, :, :-1] += c_lr
+        conductance_sum[:, :, 1:] += c_lr
+        weighted_neighbor_sum[:, :-1, :] += c_ud * score[:, 1:, :]
+        weighted_neighbor_sum[:, 1:, :] += c_ud * score[:, :-1, :]
+        conductance_sum[:, :-1, :] += c_ud
+        conductance_sum[:, 1:, :] += c_ud
+        neighbor_mean = torch.where(
+            conductance_sum > 1e-8,
+            weighted_neighbor_sum / conductance_sum.clamp_min(1e-8),
+            score,
+        )
+
+        confidence = (2.0 * score - 1.0).abs().clamp(0.0, 1.0)
+        score_p1 = confidence * score + (1.0 - confidence) * neighbor_mean
+        input_in_unit_interval = bool((score.min() >= 0.0) and (score.max() <= 1.0))
+        if input_in_unit_interval:
+            score_p1 = score_p1.clamp(0.0, 1.0)
+
+        def normalized_threshold(x: torch.Tensor) -> torch.Tensor:
+            x = x - x.amin(dim=(-2, -1), keepdim=True)
+            return x / x.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-6) > 0.5
+
+        conductance = torch.cat([c_lr.reshape(-1), c_ud.reshape(-1)])
+        self.last_p1_diffusion_analysis = {
+            "score_before_mean": float(score.mean()),
+            "score_after_mean": float(score_p1.mean()),
+            "score_change_abs_mean": float((score_p1 - score).abs().mean()),
+            "score_change_abs_max": float((score_p1 - score).abs().max()),
+            "confidence_mean": float(confidence.mean()),
+            "conductance_mean": float(conductance.mean()),
+            "conductance_std": float(conductance.std(unbiased=False)),
+            "sigma_feat": float(sigma_feat),
+            "sigma_rgb": float(sigma_rgb),
+            "neighbor_mean_minus_score_abs_mean": float((neighbor_mean - score).abs().mean()),
+            "threshold_flip_count": int((normalized_threshold(score) != normalized_threshold(score_p1)).sum()),
+            "threshold_flip_fraction": float((normalized_threshold(score) != normalized_threshold(score_p1)).float().mean()),
+            "low_conf_fraction": float((confidence < 0.5).float().mean()),
+        }
+        return score_p1.squeeze(0) if score_part4.ndim == 2 else score_p1
 
     # ══════════════════════════════════════════════════════════════════════
     # Part 1: Positional debiasing (是否去除位置偏置)
@@ -375,8 +449,7 @@ class FoRIS(nn.Module):
         n_refs: int,
         *,
         mu_fg_per_reference: bool,
-        return_hard_bg: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor] | None:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None:
         """Build mu_fg, hard-negative mu_bg, and optional clustered FG prototypes."""
         ref_means: list[torch.Tensor] = []
         fg_cols: list[torch.Tensor] = []
@@ -411,7 +484,6 @@ class FoRIS(nn.Module):
             mu_bg = F.normalize(hard_bg.mean(dim=1), dim=0)
         else:
             mu_bg = torch.zeros_like(mu_fg)
-            hard_bg = mu_bg.unsqueeze(1)
 
         fg_protos: torch.Tensor | None = None
         if self.enable_clustering and fg_tokens.shape[1] > 0:
@@ -420,8 +492,6 @@ class FoRIS(nn.Module):
             k_fg = int(labels_fg.max().item()) + 1
             fg_protos = compute_cluster_prototypes(x_fg, labels_fg, K=k_fg)
 
-        if return_hard_bg:
-            return mu_fg, mu_bg, fg_protos, hard_bg
         return mu_fg, mu_bg, fg_protos
 
     def _part2_stage1_feature_gating(
@@ -497,41 +567,17 @@ class FoRIS(nn.Module):
             ref_masks_ds,
             n_refs,
             mu_fg_per_reference=True,
-            return_hard_bg=True,
         )
         if stats is None:
             return None
-        mu_fg, mu_bg, fg_protos, hard_bg = stats
+        mu_fg, mu_bg, fg_protos = stats
 
-        # B1: retain the baseline hard-BG mean and build a multi-modal bank from
-        # exactly the same top-20% hard-negative tokens.
-        if hard_bg.shape[1] <= 1:
-            bg_protos = mu_bg.unsqueeze(0)
-        else:
-            x_bg = F.normalize(hard_bg.transpose(0, 1), p=2, dim=1)
-            labels_bg = agglomerative_clustering(x_bg, tau=self.tau)
-            k_bg = max(1, int(labels_bg.max().item()) + 1)
-            prototypes = []
-            for k_idx in range(k_bg):
-                mk = labels_bg == k_idx
-                if bool(mk.any()):
-                    prototypes.append(F.normalize(hard_bg[:, mk].mean(dim=1), p=2, dim=0))
-            bg_protos = torch.stack(prototypes, dim=0) if prototypes else mu_bg.unsqueeze(0)
-
-        dot_bg = torch.einsum("kc,c->k", bg_protos, mu_fg)
-        bg_orth = bg_protos - dot_bg.unsqueeze(1) * mu_fg.unsqueeze(0)
-        bg_orth_norm = bg_orth.norm(p=2, dim=1, keepdim=True)
-        bg_orth_fallback = bg_orth_norm.squeeze(1) <= 1e-8
-        bg_protos_score = torch.where(
-            bg_orth_norm > 1e-8,
-            bg_orth / bg_orth_norm.clamp_min(1e-8),
-            bg_protos,
-        )
-
-        # The original single-BG path is retained solely as a diagnostic reference.
-        dot_single = (mu_bg * mu_fg).sum()
-        mu_bg_orth = mu_bg - dot_single * mu_fg
-        mu_bg_score = mu_bg_orth / mu_bg_orth.norm().clamp_min(1e-8)
+        # Hard-negative mean is often correlated with mu_fg; orthogonalize so sim_bg
+        # measures similarity along directions not explained by the foreground prototype.
+        dot = (mu_bg * mu_fg).sum()
+        orth = mu_bg - dot * mu_fg
+        n = orth.norm()
+        mu_bg = orth / n.clamp_min(1e-8)
 
         # Foreground scoring: clustered multi-prototypes via log-sum-exp aggregation.
         sim_khw = torch.einsum(
@@ -540,27 +586,7 @@ class FoRIS(nn.Module):
         t = max(1e-4, self.cluster_logsumexp_temp)
         sim_fg_hw = (t * torch.logsumexp(sim_khw / t, dim=1)).squeeze(0)  # (h, w)
 
-        sim_bg_khw = torch.einsum("bchw,kc->bkhw", target_feat_for_cluster, bg_protos_score)
-        bg_single_score = torch.einsum("bchw,c->bhw", target_feat_for_cluster, mu_bg_score)
-        bg_raw_lse_score = t * torch.logsumexp(sim_bg_khw / t, dim=1)
-        k_bg = int(sim_bg_khw.shape[1])
-        bg_count_bias_term = t * math.log(max(1, k_bg))
-        sim_bg_hw = bg_raw_lse_score - bg_count_bias_term
-        self.last_b1_bg_analysis = {
-            "num_hard_bg_tokens": int(hard_bg.shape[1]),
-            "num_bg_prototypes": k_bg,
-            "bg_single_score_mean": float(bg_single_score.mean()),
-            "bg_single_score_std": float(bg_single_score.std(unbiased=False)),
-            "bg_raw_lse_score_mean": float(bg_raw_lse_score.mean()),
-            "bg_raw_lse_score_std": float(bg_raw_lse_score.std(unbiased=False)),
-            "bg_logmeanexp_score_mean": float(sim_bg_hw.mean()),
-            "bg_logmeanexp_score_std": float(sim_bg_hw.std(unbiased=False)),
-            "bg_raw_lse_minus_single_abs_mean": float((bg_raw_lse_score - bg_single_score).abs().mean()),
-            "bg_logmeanexp_minus_single_abs_mean": float((sim_bg_hw - bg_single_score).abs().mean()),
-            "bg_count_bias_term": float(bg_count_bias_term),
-            "bg_orth_fallback_count": int(bg_orth_fallback.sum()),
-            "bg_orth_fallback_fraction": float(bg_orth_fallback.float().mean()),
-        }
+        sim_bg_hw = torch.einsum("bchw,c->bhw", target_feat_for_score, mu_bg)
         sb = sim_bg_hw.squeeze(0)  # (h, w)
         score_dino = sim_fg_hw - w_bg * sb
 

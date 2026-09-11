@@ -106,11 +106,11 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
         fg_union = area_union[1].clamp_min(1.0)
         episode_iou = (area_inter[1] / fg_union * 100.0).item()
         analysis = getattr(model, "last_hg_part4_analysis", None)
-        b1_analysis = getattr(model, "last_b1_bg_analysis", None)
+        p1_analysis = getattr(model, "last_p1_diffusion_analysis", None)
         if analysis is not None:
             component_records.append({"episode_index": int(idx), "class_id": int(class_id[0].item()),
                                       "num_shots": int(len(ref_imgs)), "episode_iou": float(episode_iou), "hg": analysis,
-                                      "b1_1_bg": b1_analysis})
+                                      "p1_diffusion": p1_analysis})
         # save_episode_visualizations(
         #     reference_image=ref_imgs[0],
         #     reference_mask=ref_masks[0],
@@ -139,21 +139,18 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
     def correlation(key):
         x=np.array([r["episode_iou"] for r in component_records]); y=np.array([r["hg"][key] for r in component_records])
         return float(np.corrcoef(x,y)[0,1]) if len(x)>=2 and np.isfinite(x).all() and np.isfinite(y).all() and x.std()>1e-12 and y.std()>1e-12 else None
-    b1_records = [r["b1_1_bg"] for r in component_records if r["b1_1_bg"] is not None]
-    def b1_avg(key):
-        xs = [r[key] for r in b1_records]
+    p1_records = [r["p1_diffusion"] for r in component_records if r["p1_diffusion"] is not None]
+    def p1_avg(key):
+        xs = [r[key] for r in p1_records]
         return float(np.mean(xs)) if xs else None
-    def b1_stat(key, fn):
-        xs = np.array([r[key] for r in b1_records], dtype=float)
-        return float(fn(xs)) if xs.size else None
-    def b1_correlation(key):
-        xs = [(r["episode_iou"], r["b1_1_bg"][key]) for r in component_records if r["b1_1_bg"] is not None]
+    def p1_correlation(key):
+        xs = [(r["episode_iou"], r["p1_diffusion"][key]) for r in component_records if r["p1_diffusion"] is not None]
         if len(xs) < 2:
             return None
         x, y = np.asarray(xs, dtype=float).T
         return float(np.corrcoef(x, y)[0, 1]) if np.isfinite(x).all() and np.isfinite(y).all() and x.std()>1e-12 and y.std()>1e-12 else None
     summary={"mode":"original_symmetric_hg_gate","num_episodes":len(component_records),"miou":float(miou),"hg_gate_mean":avg("hg_gate_mean"),"raw_reliability_mean":avg("raw_reliability_mean"),"negative_retention_ratio_mean":avg("negative_retention_ratio"),"positive_retention_ratio_mean":avg("positive_retention_ratio"),"empty_hypergraph_fallback_count":int(sum(r["hg"]["empty_hypergraph_fallback"] for r in component_records)),"gate_formula_error_abs_max":max([r["hg"]["gate_formula_error_abs_max"] for r in component_records],default=None),"correction_retention_ratio_mean":avg("correction_retention_ratio"),"sign_flip_count_total":int(sum(r["hg"]["sign_flip_count"] for r in component_records)),"corr_episode_iou_vs_negative_retention":correlation("negative_retention_ratio")}
-    summary["b1_1_bg_summary"]={"num_bg_prototypes_mean":b1_avg("num_bg_prototypes"),"num_bg_prototypes_std":b1_stat("num_bg_prototypes",np.std),"num_bg_prototypes_min":b1_stat("num_bg_prototypes",np.min),"num_bg_prototypes_max":b1_stat("num_bg_prototypes",np.max),"num_hard_bg_tokens_mean":b1_avg("num_hard_bg_tokens"),"bg_count_bias_term_mean":b1_avg("bg_count_bias_term"),"bg_raw_lse_minus_single_abs_mean":b1_avg("bg_raw_lse_minus_single_abs_mean"),"bg_logmeanexp_minus_single_abs_mean":b1_avg("bg_logmeanexp_minus_single_abs_mean"),"bg_orth_fallback_fraction_mean":b1_avg("bg_orth_fallback_fraction"),"corr_episode_iou_vs_num_bg_prototypes":b1_correlation("num_bg_prototypes"),"corr_episode_iou_vs_bg_logmeanexp_minus_single_abs_mean":b1_correlation("bg_logmeanexp_minus_single_abs_mean")}
+    summary["p1_diffusion_summary"]={"score_change_abs_mean":p1_avg("score_change_abs_mean"),"confidence_mean":p1_avg("confidence_mean"),"conductance_mean":p1_avg("conductance_mean"),"sigma_feat_mean":p1_avg("sigma_feat"),"sigma_rgb_mean":p1_avg("sigma_rgb"),"threshold_flip_fraction_mean":p1_avg("threshold_flip_fraction"),"corr_episode_iou_vs_score_change_abs_mean":p1_correlation("score_change_abs_mean"),"corr_episode_iou_vs_threshold_flip_fraction":p1_correlation("threshold_flip_fraction"),"corr_episode_iou_vs_low_conf_fraction":p1_correlation("low_conf_fraction")}
     payload={"component":{"name":"part4_evidence_consistency_hypergraph_gate","mode":"original_symmetric_hg_gate","description":"Part-4 cluster corrections are symmetrically attenuated by an evidence-consistency hypergraph gate.","gate_formula":"gate = 0.5 + 0.5 * raw_reliability","hyperedges":["sf_foreground_support","candidate_support","seed_prior_support"],"gate_range":[.5,1.]},"run":{"dataset":str(args.dataset),"exp_name":str(args.exp_name),"seed":int(args.seed),"num_episodes":len(component_records),"output_dir":str(args.output_dir)},"summary":summary,"episodes":component_records}
     analysis_path=join(args.output_dir,"hg_part4_component_analysis.json")
     with open(analysis_path,"w",encoding="utf-8") as fp: json.dump(payload,fp,indent=2,ensure_ascii=False)

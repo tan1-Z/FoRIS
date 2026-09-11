@@ -88,14 +88,14 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
         tgt_mask = F.interpolate(
             tgt_mask.unsqueeze(0).unsqueeze(0).float(),
             size=pred_hw, mode='nearest',
-        ).squeeze(0).squeeze(0) > 0.5
+        ).squeeze(0).squeeze(0).to(pred_mask.device) > 0.5
 
         tgt_ignore_idx = batch.get('tgt_ignore_idx')
         if tgt_ignore_idx is not None:
             tgt_ignore_idx = F.interpolate(
                 tgt_ignore_idx.unsqueeze(0).unsqueeze(0).float(),
                 size=pred_hw, mode='nearest',
-            ).squeeze(0).squeeze(0) > 0.5
+            ).squeeze(0).squeeze(0).to(pred_mask.device) > 0.5
 
         area_inter, area_union = Evaluator.classify_prediction(
             pred_mask, tgt_mask,

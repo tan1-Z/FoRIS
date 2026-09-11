@@ -98,6 +98,7 @@ class FoRIS(nn.Module):
 
         self.should_debiass = True
         self.last_hg_part4_analysis = None
+        self.last_b1_bg_analysis = None
 
     # ──────────────────────── Public API ────────────────────────
 
@@ -520,15 +521,17 @@ class FoRIS(nn.Module):
         dot_bg = torch.einsum("kc,c->k", bg_protos, mu_fg)
         bg_orth = bg_protos - dot_bg.unsqueeze(1) * mu_fg.unsqueeze(0)
         bg_orth_norm = bg_orth.norm(p=2, dim=1, keepdim=True)
+        bg_orth_fallback = bg_orth_norm.squeeze(1) <= 1e-8
         bg_protos_score = torch.where(
             bg_orth_norm > 1e-8,
             bg_orth / bg_orth_norm.clamp_min(1e-8),
             bg_protos,
         )
-        self.last_b1_bg_analysis = {
-            "num_hard_bg_tokens": int(hard_bg.shape[1]),
-            "num_bg_prototypes": int(bg_protos.shape[0]),
-        }
+
+        # The original single-BG path is retained solely as a diagnostic reference.
+        dot_single = (mu_bg * mu_fg).sum()
+        mu_bg_orth = mu_bg - dot_single * mu_fg
+        mu_bg_score = mu_bg_orth / mu_bg_orth.norm().clamp_min(1e-8)
 
         # Foreground scoring: clustered multi-prototypes via log-sum-exp aggregation.
         sim_khw = torch.einsum(
@@ -538,7 +541,26 @@ class FoRIS(nn.Module):
         sim_fg_hw = (t * torch.logsumexp(sim_khw / t, dim=1)).squeeze(0)  # (h, w)
 
         sim_bg_khw = torch.einsum("bchw,kc->bkhw", target_feat_for_cluster, bg_protos_score)
-        sim_bg_hw = t * torch.logsumexp(sim_bg_khw / t, dim=1)
+        bg_single_score = torch.einsum("bchw,c->bhw", target_feat_for_cluster, mu_bg_score)
+        bg_raw_lse_score = t * torch.logsumexp(sim_bg_khw / t, dim=1)
+        k_bg = int(sim_bg_khw.shape[1])
+        bg_count_bias_term = t * math.log(max(1, k_bg))
+        sim_bg_hw = bg_raw_lse_score - bg_count_bias_term
+        self.last_b1_bg_analysis = {
+            "num_hard_bg_tokens": int(hard_bg.shape[1]),
+            "num_bg_prototypes": k_bg,
+            "bg_single_score_mean": float(bg_single_score.mean()),
+            "bg_single_score_std": float(bg_single_score.std(unbiased=False)),
+            "bg_raw_lse_score_mean": float(bg_raw_lse_score.mean()),
+            "bg_raw_lse_score_std": float(bg_raw_lse_score.std(unbiased=False)),
+            "bg_logmeanexp_score_mean": float(sim_bg_hw.mean()),
+            "bg_logmeanexp_score_std": float(sim_bg_hw.std(unbiased=False)),
+            "bg_raw_lse_minus_single_abs_mean": float((bg_raw_lse_score - bg_single_score).abs().mean()),
+            "bg_logmeanexp_minus_single_abs_mean": float((sim_bg_hw - bg_single_score).abs().mean()),
+            "bg_count_bias_term": float(bg_count_bias_term),
+            "bg_orth_fallback_count": int(bg_orth_fallback.sum()),
+            "bg_orth_fallback_fraction": float(bg_orth_fallback.float().mean()),
+        }
         sb = sim_bg_hw.squeeze(0)  # (h, w)
         score_dino = sim_fg_hw - w_bg * sb
 

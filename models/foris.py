@@ -100,6 +100,7 @@ class FoRIS(nn.Module):
         self.last_hg_part4_analysis = None
         self.last_p1_diffusion_analysis = None
         self.last_p1_before_mask = None
+        self.last_p1_2_mask = None
         self.last_p1_patch_attribution_state = None
 
     # ──────────────────────── Public API ────────────────────────
@@ -240,6 +241,11 @@ class FoRIS(nn.Module):
             target_hw=(tgt_image.shape[-2], tgt_image.shape[-1]),
         )
         self.last_p1_before_mask = self._finalize_mask(before_mask, tgt_image)
+        p1_2_mask = self._binarize_response(
+            self.last_p1_patch_attribution_state["score_p1_2"],
+            target_hw=(tgt_image.shape[-2], tgt_image.shape[-1]),
+        )
+        self.last_p1_2_mask = self._finalize_mask(p1_2_mask, tgt_image)
 
         denoised_mask = self._binarize_response(
             score,
@@ -332,7 +338,19 @@ class FoRIS(nn.Module):
 
         confidence = (2.0 * score_norm - 1.0).abs().clamp(0.0, 1.0)
         score_norm_symmetric = confidence * score_norm + (1.0 - confidence) * neighbor_mean
-        score_norm_p1 = torch.minimum(score_norm, score_norm_symmetric)
+        p1_2_dissipation = (1.0 - confidence) * (score_norm - neighbor_mean).clamp_min(0.0)
+        score_norm_p1_2 = score_norm - p1_2_dissipation
+        fg_patch = score_norm > 0.5
+        fg_neighbor_count = torch.zeros_like(score_norm, dtype=torch.long)
+        valid_neighbor_count = torch.zeros_like(score_norm, dtype=torch.long)
+        fg_neighbor_count[:, :, :-1] += fg_patch[:, :, 1:].long(); fg_neighbor_count[:, :, 1:] += fg_patch[:, :, :-1].long()
+        valid_neighbor_count[:, :, :-1] += 1; valid_neighbor_count[:, :, 1:] += 1
+        fg_neighbor_count[:, :-1, :] += fg_patch[:, 1:, :].long(); fg_neighbor_count[:, 1:, :] += fg_patch[:, :-1, :].long()
+        valid_neighbor_count[:, :-1, :] += 1; valid_neighbor_count[:, 1:, :] += 1
+        core_protection = fg_patch.float() * fg_neighbor_count.float() / valid_neighbor_count.clamp_min(1).float()
+        p1_3_dissipation = (1.0 - core_protection) * p1_2_dissipation
+        score_norm_p1 = score_norm - p1_3_dissipation
+        score_p1_2 = score_raw if bool(score_range <= 1e-6) else score_min + score_range * score_norm_p1_2
         score_p1 = score_raw if bool(score_range <= 1e-6) else score_min + score_range * score_norm_p1
 
         conductance = torch.cat([c_lr.reshape(-1), c_ud.reshape(-1)])
@@ -348,7 +366,7 @@ class FoRIS(nn.Module):
         if bool(patch_bg_to_fg.any()):
             raise RuntimeError("P1.2 monotonicity violation: patch BG->FG flip detected.")
         self.last_p1_diffusion_analysis = {
-            "mode": "p1_2_one_sided_dissipative",
+            "mode": "p1_3_core_preserving_dissipation",
             "raw_score_min": float(score_min),
             "raw_score_max": float(score_max),
             "raw_score_range": float(score_range),
@@ -389,10 +407,22 @@ class FoRIS(nn.Module):
             "patch_bg_to_fg_count": int(patch_bg_to_fg.sum()),
             "monotonicity_violation_count": int(monotonicity_violation.sum()),
             "monotonicity_violation_max": float((score_norm_p1 - score_norm).clamp_min(0.0).max()),
+            "fg_patch_fraction": float(fg_patch.float().mean()),
+            "core_protection_mean_all": float(core_protection.mean()),
+            "core_protection_mean_fg": float(core_protection[fg_patch].mean()) if bool(fg_patch.any()) else 0.0,
+            "p1_2_dissipation_mean": float(p1_2_dissipation.mean()),
+            "p1_3_dissipation_mean": float(p1_3_dissipation.mean()),
+            "dissipation_reduction_mean": float((p1_2_dissipation - p1_3_dissipation).mean()),
+            "dissipation_reduction_max": float((p1_2_dissipation - p1_3_dissipation).max()),
+            "p1_2_lower_bound_violation_count": int((score_norm_p1 < score_norm_p1_2 - 1e-7).sum()),
+            "p1_2_lower_bound_violation_max": float((score_norm_p1_2 - score_norm_p1).clamp_min(0.0).max()),
         }
         self.last_p1_patch_attribution_state = {
             "score_norm": score_norm.detach(), "score_norm_p1": score_norm_p1.detach(),
             "confidence": confidence.detach(), "neighbor_mean_norm": neighbor_mean.detach(),
+            "score_norm_p1_2": score_norm_p1_2.detach(), "score_p1_2": score_p1_2.detach(),
+            "core_protection": core_protection.detach(), "fg_neighbor_count": fg_neighbor_count.detach(),
+            "p1_2_dissipation": p1_2_dissipation.detach(), "p1_3_dissipation": p1_3_dissipation.detach(),
         }
         return score_p1.squeeze(0) if score_part4.ndim == 2 else score_p1
 

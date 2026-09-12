@@ -60,6 +60,7 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
     # accepted; their default CUDA buffers match the supported GPU workflow.
     meter = AverageMeter(args.dataset, list(ds.class_ids))
     meter_before = AverageMeter(args.dataset, list(ds.class_ids))
+    meter_p1_2 = AverageMeter(args.dataset, list(ds.class_ids))
     component_records = []
     signal_names = ("sf", "sbn", "semantic_margin", "cand_soft", "seed_prior", "candidate_seed_support", "fg_support_mean", "fg_vs_bg_margin", "score_norm", "confidence", "neighbor_mean_norm", "dissipation_gap", "distance_to_threshold")
     pooled_signals = {key: {"corrective": [], "harmful": [], "episode_diffs": []} for key in signal_names}
@@ -75,11 +76,21 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
         score_norm_p1 = state["score_norm_p1"].squeeze()
         gt_patch = F.interpolate(gt[None, None].float(), size=score_norm.shape, mode="nearest")[0, 0] > .5
         removed = (score_norm > .5) & ~(score_norm_p1 > .5)
+        p1_2_patch = state["score_norm_p1_2"].squeeze() > .5
+        before_patch = score_norm > .5
+        p1_2_removed = before_patch & ~p1_2_patch
+        prevented_patch = p1_2_removed & (score_norm_p1 > .5)
         corrective, harmful = removed & ~gt_patch, removed & gt_patch
         sf, sbn, cand, seed = (state[key].squeeze() for key in ("sf", "sbn", "cand_soft", "seed_prior"))
         signals = {"sf": sf, "sbn": sbn, "semantic_margin": sf - sbn, "cand_soft": cand, "seed_prior": seed, "candidate_seed_support": .5 * (cand + seed), "fg_support_mean": (sf + cand + seed) / 3., "score_norm": score_norm, "confidence": state["confidence"].squeeze(), "neighbor_mean_norm": state["neighbor_mean_norm"].squeeze(), "dissipation_gap": (score_norm - state["neighbor_mean_norm"].squeeze()).clamp_min(0.), "distance_to_threshold": (score_norm - .5).abs()}
         signals["fg_vs_bg_margin"] = signals["fg_support_mean"] - sbn
-        result = {"removed_patch_count": int(removed.sum()), "corrective_removed_patch_count": int(corrective.sum()), "harmful_removed_patch_count": int(harmful.sum()), "signals": {}}
+        fg_neighbor_count = state["fg_neighbor_count"].squeeze()
+        neighbor_table = {}
+        for k in range(5):
+            selected = p1_2_removed & (fg_neighbor_count == k)
+            count = int(selected.sum())
+            neighbor_table[str(k)] = {"p1_2_removed_count": count, "gt_fg_fraction": float(gt_patch[selected].float().mean()) if count else None, "gt_bg_fraction": float((~gt_patch[selected]).float().mean()) if count else None, "p1_3_prevented_count": int((selected & prevented_patch).sum())}
+        result = {"removed_patch_count": int(removed.sum()), "corrective_removed_patch_count": int(corrective.sum()), "harmful_removed_patch_count": int(harmful.sum()), "p1_2_patch_fg_to_bg_count": int(p1_2_removed.sum()), "p1_3_patch_fg_to_bg_count": int(removed.sum()), "prevented_patch_fg_to_bg_count": int(prevented_patch.sum()), "prevented_patch_fg_to_bg_fraction": float(prevented_patch.float().mean()), "prevented_patch_true_fg": int((prevented_patch & gt_patch).sum()), "prevented_patch_false_fg": int((prevented_patch & (~gt_patch)).sum()), "neighbor_count_attribution": neighbor_table, "signals": {}}
         for key, values in signals.items():
             c, h = values[corrective], values[harmful]
             c_stats, h_stats = distribution(c), distribution(h)
@@ -140,10 +151,18 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
             before_mask, tgt_mask, tgt_ignore_idx=tgt_ignore_idx,
         )
         meter_before.update(before_inter, before_union, class_id)
+        p1_2_mask = getattr(model, "last_p1_2_mask", None)
+        if p1_2_mask is None:
+            raise RuntimeError("P1.3 P1.2 counterfactual mask was not produced.")
+        p1_2_inter, p1_2_union = Evaluator.classify_prediction(
+            p1_2_mask, tgt_mask, tgt_ignore_idx=tgt_ignore_idx,
+        )
+        meter_p1_2.update(p1_2_inter, p1_2_union, class_id)
 
         fg_union = area_union[1].clamp_min(1.0)
         episode_iou = (area_inter[1] / fg_union * 100.0).item()
         before_iou = (before_inter[1] / before_union[1].clamp_min(1.0) * 100.0).item()
+        p1_2_iou = (p1_2_inter[1] / p1_2_union[1].clamp_min(1.0) * 100.0).item()
         before_fg, after_fg = before_mask.bool(), pred_mask.bool()
         valid = torch.ones_like(after_fg, dtype=torch.bool) if tgt_ignore_idx is None else ~tgt_ignore_idx
         bg_to_fg = (~before_fg) & after_fg & valid
@@ -157,7 +176,10 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
         corrective_flip_count = corrective_bg_to_fg + corrective_fg_to_bg
         harmful_flip_count = harmful_bg_to_fg + harmful_fg_to_bg
         fg_to_bg_count, bg_to_fg_count = int(fg_to_bg.sum()), int(bg_to_fg.sum())
-        counterfactual = {"iou_before": float(before_iou), "iou_after": float(episode_iou), "delta_iou": float(episode_iou - before_iou), "flip_count": flip_count, "flip_fraction": float(flip_count / max(1, valid_count)), "fg_to_bg_count": fg_to_bg_count, "bg_to_fg_count": bg_to_fg_count, "fg_to_bg_fraction": float(fg_to_bg_count / max(1, valid_count)), "bg_to_fg_fraction": float(bg_to_fg_count / max(1, valid_count)), "corrective_flip_count": corrective_flip_count, "harmful_flip_count": harmful_flip_count, "corrective_flip_fraction": float(corrective_flip_count / max(1, flip_count)), "harmful_flip_fraction": float(harmful_flip_count / max(1, flip_count)), "net_corrective_flips": corrective_flip_count - harmful_flip_count, "corrective_bg_to_fg": corrective_bg_to_fg, "harmful_bg_to_fg": harmful_bg_to_fg, "corrective_fg_to_bg": corrective_fg_to_bg, "harmful_fg_to_bg": harmful_fg_to_bg}
+        p1_2_removed = before_fg & (~p1_2_mask.bool()) & valid
+        p1_3_removed = before_fg & (~after_fg) & valid
+        prevented_final = p1_2_removed & after_fg
+        counterfactual = {"iou_before": float(before_iou), "iou_p1_2": float(p1_2_iou), "iou_after": float(episode_iou), "delta_iou": float(episode_iou - before_iou), "delta_p1_2_vs_before": float(p1_2_iou - before_iou), "delta_p1_3_vs_before": float(episode_iou - before_iou), "delta_p1_3_vs_p1_2": float(episode_iou - p1_2_iou), "flip_count": flip_count, "flip_fraction": float(flip_count / max(1, valid_count)), "fg_to_bg_count": fg_to_bg_count, "bg_to_fg_count": bg_to_fg_count, "p1_2_final_fg_to_bg_count": int(p1_2_removed.sum()), "p1_3_final_fg_to_bg_count": int(p1_3_removed.sum()), "prevented_final_fg_to_bg_count": int(prevented_final.sum()), "protected_true_fg_count": int((prevented_final & tgt_mask).sum()), "protected_false_fg_count": int((prevented_final & (~tgt_mask)).sum()), "fg_to_bg_fraction": float(fg_to_bg_count / max(1, valid_count)), "bg_to_fg_fraction": float(bg_to_fg_count / max(1, valid_count)), "corrective_flip_count": corrective_flip_count, "harmful_flip_count": harmful_flip_count, "corrective_flip_fraction": float(corrective_flip_count / max(1, flip_count)), "harmful_flip_fraction": float(harmful_flip_count / max(1, flip_count)), "net_corrective_flips": corrective_flip_count - harmful_flip_count, "corrective_bg_to_fg": corrective_bg_to_fg, "harmful_bg_to_fg": harmful_bg_to_fg, "corrective_fg_to_bg": corrective_fg_to_bg, "harmful_fg_to_bg": harmful_fg_to_bg}
         analysis = getattr(model, "last_hg_part4_analysis", None)
         p1_analysis = getattr(model, "last_p1_diffusion_analysis", None)
         attribution_state = getattr(model, "last_p1_patch_attribution_state", None)
@@ -186,7 +208,8 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
     # ──────── Final results ────────
     miou = meter.compute_iou()[0].item()
     miou_before = meter_before.compute_iou()[0].item()
-    out_str = f'mIoU after P1.1 = {miou:.1f}; same-run before P1.1 = {miou_before:.1f}; delta = {miou - miou_before:.3f}'
+    miou_p1_2 = meter_p1_2.compute_iou()[0].item()
+    out_str = f'mIoU before = {miou_before:.1f}; P1.2 = {miou_p1_2:.1f}; P1.3 = {miou:.1f}; P1.3-P1.2 = {miou - miou_p1_2:.3f}'
     print(out_str)
     with open(log_file, 'a') as fp:
         fp.write(out_str + '\n')
@@ -232,6 +255,13 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
     total_corrective_bg_to_fg = int(sum(r["corrective_bg_to_fg"] for r in cf_records))
     total_harmful_bg_to_fg = int(sum(r["harmful_bg_to_fg"] for r in cf_records))
     summary["p1_2_summary"]={"mode":"p1_2_one_sided_dissipative","miou_before_same_run":float(miou_before),"miou_after":float(miou),"miou_delta_same_run":float(miou-miou_before),"delta_iou_mean":cf_avg("delta_iou"),"delta_iou_median":cf_percentile(50),"improved_episode_fraction":float(np.mean([r["delta_iou"] > 1e-8 for r in cf_records])) if cf_records else None,"declined_episode_fraction":float(np.mean([r["delta_iou"] < -1e-8 for r in cf_records])) if cf_records else None,"unchanged_episode_fraction":float(np.mean([abs(r["delta_iou"]) <= 1e-8 for r in cf_records])) if cf_records else None,"upward_candidate_fraction_mean":p1_avg("upward_candidate_fraction"),"downward_candidate_fraction_mean":p1_avg("downward_candidate_fraction"),"rejected_upward_abs_mean":p1_avg("rejected_upward_abs_mean"),"accepted_dissipation_mean":p1_avg("accepted_dissipation_mean"),"patch_bg_to_fg_count_total":p1_sum("patch_bg_to_fg_count"),"patch_fg_to_bg_count_total":p1_sum("patch_fg_to_bg_count"),"final_bg_to_fg_count_total":int(sum(r["bg_to_fg_count"] for r in cf_records)),"final_fg_to_bg_count_total":int(sum(r["fg_to_bg_count"] for r in cf_records)),"fg_to_bg_corrective_fraction_pooled":float(total_corrective_fg_to_bg / max(1, total_corrective_fg_to_bg + total_harmful_fg_to_bg)),"bg_to_fg_corrective_fraction_pooled":float(total_corrective_bg_to_fg / max(1, total_corrective_bg_to_fg + total_harmful_bg_to_fg)),"corr_delta_iou_vs_accepted_dissipation":cf_correlation("accepted_dissipation_mean"),"corr_delta_iou_vs_fg_to_bg_flip_fraction":cf_self_correlation("fg_to_bg_fraction")}
+    topology_records = [r["p1_2_flip_attribution"] for r in component_records if r["p1_2_flip_attribution"] is not None]
+    neighbor_count_attribution = {str(k): {"p1_2_removed_count": int(sum(r["neighbor_count_attribution"][str(k)]["p1_2_removed_count"] for r in topology_records)), "p1_3_prevented_count": int(sum(r["neighbor_count_attribution"][str(k)]["p1_3_prevented_count"] for r in topology_records))} for k in range(5)}
+    for k, row in neighbor_count_attribution.items():
+        total_fg = sum(r["neighbor_count_attribution"][k]["gt_fg_fraction"] * r["neighbor_count_attribution"][k]["p1_2_removed_count"] for r in topology_records if r["neighbor_count_attribution"][k]["gt_fg_fraction"] is not None)
+        row["gt_fg_fraction"] = float(total_fg / max(1, row["p1_2_removed_count"]))
+        row["gt_bg_fraction"] = 1.0 - row["gt_fg_fraction"]
+    summary["p1_3_summary"]={"mode":"p1_3_core_preserving_dissipation","miou_before_same_run":float(miou_before),"miou_p1_2_same_run":float(miou_p1_2),"miou_p1_3":float(miou),"delta_p1_2_vs_before":float(miou_p1_2-miou_before),"delta_p1_3_vs_before":float(miou-miou_before),"delta_p1_3_vs_p1_2":float(miou-miou_p1_2),"episode_delta_p1_3_vs_p1_2_mean":cf_avg("delta_p1_3_vs_p1_2"),"episode_delta_p1_3_vs_p1_2_median":float(np.median([r["delta_p1_3_vs_p1_2"] for r in cf_records])) if cf_records else None,"p1_2_patch_fg_to_bg_total":int(sum(r["p1_2_patch_fg_to_bg_count"] for r in topology_records)),"p1_3_patch_fg_to_bg_total":int(sum(r["p1_3_patch_fg_to_bg_count"] for r in topology_records)),"prevented_patch_fg_to_bg_total":int(sum(r["prevented_patch_fg_to_bg_count"] for r in topology_records)),"p1_2_final_fg_to_bg_total":int(sum(r["p1_2_final_fg_to_bg_count"] for r in cf_records)),"p1_3_final_fg_to_bg_total":int(sum(r["p1_3_final_fg_to_bg_count"] for r in cf_records)),"prevented_final_fg_to_bg_total":int(sum(r["prevented_final_fg_to_bg_count"] for r in cf_records)),"protected_true_fg_total":int(sum(r["protected_true_fg_count"] for r in cf_records)),"protected_false_fg_total":int(sum(r["protected_false_fg_count"] for r in cf_records)),"protected_true_fg_fraction":float(sum(r["protected_true_fg_count"] for r in cf_records) / max(1, sum(r["protected_true_fg_count"] + r["protected_false_fg_count"] for r in cf_records))),"core_protection_mean_fg":p1_avg("core_protection_mean_fg"),"dissipation_reduction_mean":p1_avg("dissipation_reduction_mean"),"monotonicity_violation_count_total":p1_sum("monotonicity_violation_count"),"p1_2_lower_bound_violation_count_total":p1_sum("p1_2_lower_bound_violation_count"),"neighbor_count_attribution":neighbor_count_attribution}
     def rank_auc(corrective, harmful):
         if corrective.size == 0 or harmful.size == 0:
             return None

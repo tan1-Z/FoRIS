@@ -348,8 +348,13 @@ class FoRIS(nn.Module):
         neighbor_mean_step2 = neighbor_for(score_norm_p1_2)
         confidence_step2 = (2.0 * score_norm_p1_2 - 1.0).abs().clamp(0.0, 1.0)
         step2_dissipation = (1.0 - confidence_step2) * (score_norm_p1_2 - neighbor_mean_step2).clamp_min(0.0)
-        score_norm_p1 = score_norm_p1_2 - step2_dissipation
-        score_p1_2 = score_raw if bool(score_range <= 1e-6) else score_min + score_range * score_norm_p1_2
+        score_norm_step2 = score_norm_p1_2 - step2_dissipation
+        neighbor_mean_step3 = neighbor_for(score_norm_step2)
+        confidence_step3 = (2.0 * score_norm_step2 - 1.0).abs().clamp(0.0, 1.0)
+        step3_dissipation = (1.0 - confidence_step3) * (score_norm_step2 - neighbor_mean_step3).clamp_min(0.0)
+        score_norm_p1 = score_norm_step2 - step3_dissipation
+        score_p1_1 = score_raw if bool(score_range <= 1e-6) else score_min + score_range * score_norm_p1_2
+        score_p1_2 = score_raw if bool(score_range <= 1e-6) else score_min + score_range * score_norm_step2
         score_p1 = score_raw if bool(score_range <= 1e-6) else score_min + score_range * score_norm_p1
 
         conductance = torch.cat([c_lr.reshape(-1), c_ud.reshape(-1)])
@@ -365,7 +370,7 @@ class FoRIS(nn.Module):
         if bool(patch_bg_to_fg.any()):
             raise RuntimeError("P1.2 monotonicity violation: patch BG->FG flip detected.")
         self.last_p1_diffusion_analysis = {
-            "mode": "p1_2_two_step_one_sided_dissipation",
+            "mode": "p1_2_three_step_one_sided_dissipation",
             "raw_score_min": float(score_min),
             "raw_score_max": float(score_max),
             "raw_score_range": float(score_range),
@@ -408,16 +413,17 @@ class FoRIS(nn.Module):
             "monotonicity_violation_max": float((score_norm_p1 - score_norm).clamp_min(0.0).max()),
             "step1_dissipation_mean": float(step1_dissipation.mean()), "step1_dissipation_max": float(step1_dissipation.max()),
             "step2_dissipation_mean": float(step2_dissipation.mean()), "step2_dissipation_max": float(step2_dissipation.max()),
+            "step3_dissipation_mean": float(step3_dissipation.mean()), "step3_dissipation_max": float(step3_dissipation.max()),
             "step2_to_step1_dissipation_ratio": None if float(step1_dissipation.mean()) <= 1e-8 else float(step2_dissipation.mean() / step1_dissipation.mean()),
-            "step1_monotonicity_violation_count": int((score_norm_p1_2 > score_norm + 1e-7).sum()), "step2_monotonicity_violation_count": int((score_norm_p1 > score_norm_p1_2 + 1e-7).sum()),
+            "step1_monotonicity_violation_count": int((score_norm_p1_2 > score_norm + 1e-7).sum()), "step2_monotonicity_violation_count": int((score_norm_step2 > score_norm_p1_2 + 1e-7).sum()), "step3_monotonicity_violation_count": int((score_norm_p1 > score_norm_step2 + 1e-7).sum()),
             "core_protection_mean_fg": 0.0, "dissipation_reduction_mean": 0.0,
             "p1_2_lower_bound_violation_count": 0,
         }
         self.last_p1_patch_attribution_state = {
             "score_norm": score_norm.detach(), "score_norm_p1": score_norm_p1.detach(),
             "confidence": confidence.detach(), "neighbor_mean_norm": neighbor_mean.detach(),
-            "score_norm_p1_2": score_norm_p1_2.detach(), "score_p1_2": score_p1_2.detach(),
-            "step1_dissipation": step1_dissipation.detach(), "step2_dissipation": step2_dissipation.detach(),
+            "score_norm_p1_2": score_norm_step2.detach(), "score_p1_2": score_p1_2.detach(), "score_p1_1": score_p1_1.detach(),
+            "step1_dissipation": step1_dissipation.detach(), "step2_dissipation": step2_dissipation.detach(), "step3_dissipation": step3_dissipation.detach(),
             "fg_neighbor_count": torch.zeros_like(score_norm, dtype=torch.long),
         }
         return score_p1.squeeze(0) if score_part4.ndim == 2 else score_p1

@@ -242,7 +242,7 @@ class FoRIS(nn.Module):
         )
         self.last_p1_before_mask = self._finalize_mask(before_mask, tgt_image)
         p1_2_mask = self._binarize_response(
-            self.last_p1_patch_attribution_state["score_p1_2"],
+            self.last_p1_patch_attribution_state["score_p1_2"].squeeze(0),
             target_hw=(tgt_image.shape[-2], tgt_image.shape[-1]),
         )
         self.last_p1_2_mask = self._finalize_mask(p1_2_mask, tgt_image)

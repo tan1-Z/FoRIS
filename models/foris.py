@@ -98,6 +98,8 @@ class FoRIS(nn.Module):
 
         self.should_debiass = True
         self.last_hg_part4_analysis = None
+        self.last_hg_a1_analysis = None
+        self.last_hg_a1_baseline_mask = None
         self.last_p1_diffusion_analysis = None
         self.last_p1_before_mask = None
         self.last_p1_2_mask = None
@@ -217,9 +219,23 @@ class FoRIS(nn.Module):
             w=w,
         )
 
-        # Part 4 — semantic consistency correction
-        score = self._part4_semantic_consistency_correction(
-            score,
+        # Same-run reference: original Part4 followed by the same P1.2/refiner.
+        score_part3 = score
+        baseline_part4 = self._part4_semantic_consistency_correction(
+            score_part3, sf=sf, sbn=sbn, cand_soft=cand_soft,
+            seed_prior=seed_prior, tgt_feat=tgt_feat_denoised,
+        )
+        baseline_refined = self._p1_uncertainty_gated_anisotropic_diffusion(
+            baseline_part4, target_feat=tgt_feat_denoised, target_rgb=tgt_image,
+        )
+        baseline_mask = self._binarize_response(
+            baseline_refined, target_hw=(tgt_image.shape[-2], tgt_image.shape[-1]),
+        )
+        self.last_hg_a1_baseline_mask = self._finalize_mask(baseline_mask, tgt_image)
+
+        # Active Part4 — sparse signed hypergraph consolidation.
+        score = self._part4_hypergraph_consolidation(
+            score_part3,
             sf=sf,
             sbn=sbn,
             cand_soft=cand_soft,
@@ -1062,4 +1078,149 @@ class FoRIS(nn.Module):
         score = score 
         delta_map = self._semantic_cluster_reweight_map(tgt_feat, sf, sbn, cand_soft, seed_prior)
         return score + delta_map
+
+    def _part4_hypergraph_consolidation(
+        self,
+        score: torch.Tensor,
+        *,
+        sf: torch.Tensor,
+        sbn: torch.Tensor,
+        cand_soft: torch.Tensor,
+        seed_prior: torch.Tensor,
+        tgt_feat: torch.Tensor,
+    ) -> torch.Tensor:
+        """Training-free, signed group correction on existing target clusters."""
+        _, channels, height, width = tgt_feat.shape
+        tokens = F.normalize(
+            tgt_feat[0].permute(1, 2, 0).reshape(-1, channels), p=2, dim=1,
+        )
+        labels = agglomerative_clustering(tokens, tau=self.tau)
+        num_nodes = int(labels.max().item()) + 1
+        prototypes = compute_cluster_prototypes(tokens, labels, K=num_nodes)
+        counts = torch.bincount(labels, minlength=num_nodes).to(dtype=score.dtype).clamp_min(1)
+
+        def cluster_mean(values: torch.Tensor) -> torch.Tensor:
+            pooled = torch.zeros(num_nodes, device=score.device, dtype=score.dtype)
+            pooled.index_add_(0, labels, values.reshape(-1))
+            return pooled / counts
+
+        fg = cluster_mean(sf)
+        bg = cluster_mean(sbn)
+        candidate = cluster_mean(cand_soft)
+        seed = cluster_mean(seed_prior)
+        conflict = torch.minimum(fg, bg)
+        uncertainty = (1.0 - 2.0 * (fg - 0.5).abs()).clamp(0.0, 1.0)
+        disagreement = (fg - candidate).abs() + (fg - seed).abs()
+        unary = (
+            self.semantic_cluster_fg_boost * (fg - bg).clamp_min(0.0)
+            - self.semantic_cluster_conflict_suppress * conflict
+            - (self.semantic_disagreement_weight * disagreement
+               + self.semantic_bg_coupling_weight * conflict)
+            * uncertainty.pow(self.semantic_penalty_uncertainty_power)
+        ).clamp(
+            min=-(self.semantic_cluster_neg_cap + self.semantic_penalty_max),
+            max=self.semantic_cluster_fg_boost,
+        )
+
+        # Candidate groups have 3–5 members. A group is selected by evidence
+        # and semantic similarity; conflict groups also require spatial adjacency.
+        evidence = {
+            "fg": (2.0 * (fg - 0.5)).clamp(0.0, 1.0),
+            "candidate": (2.0 * (candidate - 0.5)).clamp(0.0, 1.0),
+            "seed": (2.0 * (seed - 0.5)).clamp(0.0, 1.0),
+            "conflict": (bg * (1.0 - (fg + candidate + seed) / 3.0)).clamp(0.0, 1.0),
+        }
+        similarity = prototypes @ prototypes.T
+        labels_hw = labels.view(height, width)
+        adjacent = torch.zeros((num_nodes, num_nodes), dtype=torch.bool, device=labels.device)
+        for left, right in (
+            (labels_hw[:, :-1].reshape(-1), labels_hw[:, 1:].reshape(-1)),
+            (labels_hw[:-1, :].reshape(-1), labels_hw[1:, :].reshape(-1)),
+        ):
+            adjacent[left, right] = True
+            adjacent[right, left] = True
+
+        groups: list[tuple[str, torch.Tensor, torch.Tensor]] = []
+        group_counts = {key: 0 for key in evidence}
+        for kind, strength in evidence.items():
+            eligible = strength > 0.0
+            seen: set[tuple[int, ...]] = set()
+            anchor_budget = min(num_nodes, max(1, num_nodes // 4))
+            anchor_ids = torch.topk(strength, k=anchor_budget).indices
+            for anchor in anchor_ids.tolist():
+                if not bool(eligible[anchor]):
+                    continue
+                pool = eligible.clone()
+                pool[anchor] = False
+                if kind == "conflict":
+                    pool &= adjacent[anchor]
+                choices = torch.nonzero(pool, as_tuple=False).flatten()
+                if choices.numel() < 2:
+                    continue
+                ranked = torch.topk(similarity[anchor, choices], k=min(4, choices.numel())).indices
+                members = torch.cat((choices.new_tensor([anchor]), choices[ranked]))
+                identity = tuple(sorted(members.tolist()))
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                groups.append((kind, members, strength[members]))
+                group_counts[kind] += 1
+
+        positive_sum = torch.zeros_like(unary)
+        negative_sum = torch.zeros_like(unary)
+        positive_weight = torch.zeros_like(unary)
+        negative_weight = torch.zeros_like(unary)
+        reliability_sum = torch.zeros_like(unary)
+        incidence_sum = torch.zeros_like(unary)
+        edge_reliabilities: list[torch.Tensor] = []
+        for kind, members, membership in groups:
+            values = unary[members]
+            center = values.median()
+            spread = (values - center).abs().median()
+            amplitude = values.abs().median()
+            reliability = (1.0 - spread / (amplitude + 1e-8)).clamp(0.0, 1.0)
+            edge_reliabilities.append(reliability)
+            weight = membership * reliability
+            incidence_sum.index_add_(0, members, membership)
+            reliability_sum.index_add_(0, members, weight)
+            if kind == "conflict":
+                message = (-values).clamp_min(0.0).median()
+                negative_sum.index_add_(0, members, weight * message)
+                negative_weight.index_add_(0, members, weight)
+            else:
+                message = values.clamp_min(0.0).median()
+                positive_sum.index_add_(0, members, weight * message)
+                positive_weight.index_add_(0, members, weight)
+
+        positive = positive_sum / positive_weight.clamp_min(1e-8)
+        negative = negative_sum / negative_weight.clamp_min(1e-8)
+        node_reliability = (reliability_sum / incidence_sum.clamp_min(1e-8)).clamp(0.0, 1.0)
+        correction = (
+            (1.0 - node_reliability) * unary
+            + node_reliability * (positive - negative)
+        ).clamp(
+            min=-(self.semantic_cluster_neg_cap + self.semantic_penalty_max),
+            max=self.semantic_cluster_fg_boost,
+        )
+        correction = torch.where(torch.isfinite(correction), correction, unary)
+        self.last_hg_a1_analysis = {
+            "mode": "a1_sparse_signed_hypergraph_consolidation",
+            "num_nodes": num_nodes,
+            "num_hyperedges": len(groups),
+            "hyperedge_counts": group_counts,
+            "mean_hyperedge_size": float(sum(len(m) for _, m, _ in groups) / len(groups)) if groups else 0.0,
+            "max_hyperedge_size": max((len(m) for _, m, _ in groups), default=0),
+            "isolated_node_fraction": float((incidence_sum <= 1e-8).float().mean()),
+            "group_reliability_mean": float(torch.stack(edge_reliabilities).mean()) if groups else None,
+            "unary_positive_count": int((unary > 0).sum()),
+            "unary_negative_count": int((unary < 0).sum()),
+            "correction_positive_count": int((correction > 0).sum()),
+            "correction_negative_count": int((correction < 0).sum()),
+            "unary_abs_mean": float(unary.abs().mean()),
+            "correction_abs_mean": float(correction.abs().mean()),
+            "positive_message_mean": float(positive.mean()),
+            "negative_message_mean": float(negative.mean()),
+            "fallback_node_count": int((reliability_sum <= 1e-8).sum()),
+        }
+        return score + correction[labels].view(height, width)
 

@@ -101,7 +101,6 @@ class FoRIS(nn.Module):
         self.last_p1_diffusion_analysis = None
         self.last_p1_before_mask = None
         self.last_p1_2_mask = None
-        self.last_seed_margin_analysis = None
         self.last_p1_patch_attribution_state = None
 
     # ──────────────────────── Public API ────────────────────────
@@ -839,7 +838,6 @@ class FoRIS(nn.Module):
         labels = agglomerative_clustering(x_cluster, tau=self.tau)
         k = int(labels.max().item()) + 1
         if k <= 1:
-            self.last_seed_margin_analysis = {"seed_top1_score": None, "seed_top2_score": None, "seed_margin_raw": None, "seed_margin_relative": 1.0, "seed_reliability": 1.0}
             return candidate_mask.to(dtype=tgt_feat.dtype)
 
         protos = compute_cluster_prototypes(x, labels, K=k)
@@ -851,7 +849,6 @@ class FoRIS(nn.Module):
             if fg_s.shape[1] > 0:
                 ref_protos.append(fg_s.mean(dim=1))
         if len(ref_protos) == 0:
-            self.last_seed_margin_analysis = {"seed_top1_score": None, "seed_top2_score": None, "seed_margin_raw": None, "seed_margin_relative": 1.0, "seed_reliability": 1.0}
             return candidate_mask.to(dtype=tgt_feat.dtype)
 
         mu_fg = F.normalize(torch.stack(ref_protos).mean(dim=0), p=2, dim=0)
@@ -859,7 +856,6 @@ class FoRIS(nn.Module):
         labels_hw = labels.view(h, w)
         matched = labels_hw[candidate_mask]
         if matched.numel() == 0:
-            self.last_seed_margin_analysis = {"seed_top1_score": None, "seed_top2_score": None, "seed_margin_raw": None, "seed_reliability": 1.0}
             return candidate_mask.to(dtype=tgt_feat.dtype)
 
         matched_ids, counts = matched.unique(return_counts=True)
@@ -879,12 +875,7 @@ class FoRIS(nn.Module):
                 cross_sim[i] = fg_sim_flat[mask_i].mean()
 
         seed_scores = cross_sim * area_w
-        matched_scores = seed_scores[matched_ids]
-        top_scores = torch.topk(matched_scores, k=min(2, matched_scores.numel())).values
-        top1 = top_scores[0]
-        top2 = top_scores[1] if top_scores.numel() > 1 else top1.new_zeros(())
-        reliability = torch.ones_like(top1) if top_scores.numel() == 1 else ((top1 - top2) / (top1.abs() + top2.abs() + 1e-6)).clamp(0.0, 1.0)
-        seed_cluster = int(matched_ids[torch.argmax(matched_scores)].item())
+        seed_cluster = int(matched_ids[torch.argmax(seed_scores[matched_ids])].item())
 
         intra_sim = torch.einsum("c,kc->k", protos[seed_cluster], protos).clamp_min(0.0)
         combined = cross_sim * intra_sim * area_w
@@ -892,9 +883,7 @@ class FoRIS(nn.Module):
 
         lo, hi = combined.min(), combined.max()
         combined = (combined - lo) / (hi - lo).clamp_min(1e-6)
-        prior = combined[labels].view(h, w)
-        self.last_seed_margin_analysis = {"seed_top1_score": float(top1), "seed_top2_score": float(top2) if top_scores.numel() > 1 else None, "seed_margin_raw": float(top1 - top2) if top_scores.numel() > 1 else None, "seed_margin_relative": float(reliability), "seed_reliability": float(reliability)}
-        return reliability * prior
+        return combined[labels].view(h, w)
 
     def _part3_clustering(
         self,

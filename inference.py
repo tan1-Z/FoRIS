@@ -39,6 +39,12 @@ def main(args: argparse.Namespace) -> float:
 
     # ──────── Model setup ────────
     model = build_foris_from_args(args)
+    if args.method == "hyperforis" and not hasattr(model, "last_hypergraph_info"):
+        raise RuntimeError(
+            "--method hyperforis selected, but model construction returned "
+            f"{type(model).__name__}. Sync models/__init__.py, models/hyperforis.py, "
+            "and hypergraph/ from the HyperFoRIS implementation."
+        )
     model.to(args.device)
     model.eval()
 
@@ -52,6 +58,8 @@ def main(args: argparse.Namespace) -> float:
 
 
 def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) -> float:
+    if getattr(args, "method", "foris") == "hyperforis":
+        return evaluate_hyperforis(args, model, log_file)
     # ──────── Dataset and loader setup ────────
     ds = build_dataset(args.dataset, args=args)
     loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=args.num_workers,
@@ -343,6 +351,38 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
     analysis_path=join(args.output_dir,"reference_target_fg_hg_analysis.json")
     with open(analysis_path,"w",encoding="utf-8") as fp: json.dump(payload,fp,indent=2,ensure_ascii=False)
     print(f"HG component analysis saved to: {analysis_path}")
+    return miou
+
+
+def evaluate_hyperforis(args: argparse.Namespace, model: torch.nn.Module, log_file: str) -> float:
+    """Dataset evaluation for the independent HyperFoRIS path."""
+    dataset = build_dataset(args.dataset, args=args)
+    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=args.num_workers,
+                        collate_fn=lambda items: items[0])
+    meter = AverageMeter(args.dataset, list(dataset.class_ids))
+    records = []
+    for index, batch in enumerate(tqdm(loader, ncols=80)):
+        model._ref_images = model._ref_masks = None
+        for image, mask in zip(batch["ref_imgs"], batch["ref_masks"]):
+            model.set_reference(image, mask)
+        model.set_target(batch["tgt_img"])
+        prediction = model.segment()
+        target = F.interpolate(batch["tgt_mask"][None, None].float(), size=prediction.shape[-2:], mode="nearest")[0, 0].to(prediction.device) > 0.5
+        ignore = batch.get("tgt_ignore_idx")
+        if ignore is not None:
+            ignore = F.interpolate(ignore[None, None].float(), size=prediction.shape[-2:], mode="nearest")[0, 0].to(prediction.device) > 0.5
+        intersection, union = Evaluator.classify_prediction(prediction, target, tgt_ignore_idx=ignore)
+        class_id = torch.as_tensor(batch["class_id"], device=args.device).reshape(-1)
+        meter.update(intersection, union, class_id)
+        episode_iou = float((intersection[1] / union[1].clamp_min(1.0) * 100.0).item())
+        records.append({"episode_index": index, "class_id": int(class_id[0]), "episode_iou": episode_iou, **model.last_hypergraph_info})
+    miou = float(meter.compute_iou()[0].item())
+    payload = {"method": "hyperforis", "miou": miou, "num_episodes": len(records), "episodes": records}
+    path = join(args.output_dir, "hyperforis_analysis.json")
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(payload, file, indent=2, ensure_ascii=False)
+    print(f"HyperFoRIS mIoU = {miou:.3f}")
+    print(f"HyperFoRIS analysis saved to: {path}")
     return miou
 
 

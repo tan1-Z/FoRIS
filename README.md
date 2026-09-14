@@ -133,6 +133,49 @@ Supported benchmarks:
 
 ## Inference
 
+### HyperFoRIS research prototype
+
+HyperFoRIS is an independent, training-free `--method hyperforis` path. It
+keeps the frozen DINOv3 encoder but represents reference and query patches as
+nodes, constructs semantic, spatial, cross-image foreground, and multimodal
+background hyperedges for each episode, then propagates foreground/background
+confidence over those sparse relations. The original FoRIS path remains the
+default.
+
+```bash
+CUDA_VISIBLE_DEVICES=2 python inference.py \
+  --method hyperforis \
+  --dataset coco \
+  --data-root data \
+  --fold 0 \
+  --shots 1 \
+  --model-size large \
+  --semantic-k 8 \
+  --spatial-radius 1 \
+  --cross-topk 4 \
+  --background-modes 8 \
+  --propagation-steps 4 \
+  --exp-name hyperforis-semantic-spatial-cross-bg-coco
+```
+
+The first prototype implements semantic, spatial, cross-image foreground, and
+background hyperedges. `--use-topology-hyperedges` enables the initial local
+directional topology relation. Per-episode node, edge, seed, and relation
+statistics are written to `hyperforis_analysis.json`.
+
+Useful ablations:
+
+```bash
+# semantic + spatial + cross-image FG + background
+--method hyperforis
+
+# add local directional topology hyperedges
+--method hyperforis --use-topology-hyperedges
+
+# turn on deterministic relation reweighting
+--method hyperforis --adaptive-relation-weights
+```
+
 Run evaluation on a prepared dataset (default data root: `data/`):
 
 ### Conservative Risk-Gated Affinity Fusion (experimental)

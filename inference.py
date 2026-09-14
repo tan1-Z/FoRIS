@@ -59,6 +59,7 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
     # Original FoRIS metrics implementations differ on whether ``device`` is
     # accepted; their default CUDA buffers match the supported GPU workflow.
     meter = AverageMeter(args.dataset, list(ds.class_ids))
+    meter_local_hg_baseline = AverageMeter(args.dataset, list(ds.class_ids))
     meter_before = AverageMeter(args.dataset, list(ds.class_ids))
     meter_p1_2 = AverageMeter(args.dataset, list(ds.class_ids))
     component_records = []
@@ -143,6 +144,13 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
         )
         class_id = torch.as_tensor(batch['class_id'], device=args.device).reshape(-1)
         meter.update(area_inter, area_union, class_id)
+        local_baseline_mask = getattr(model, "last_local_hg_baseline_mask", None)
+        if local_baseline_mask is None:
+            raise RuntimeError("Local HG baseline mask was not produced.")
+        local_base_inter, local_base_union = Evaluator.classify_prediction(
+            local_baseline_mask, tgt_mask, tgt_ignore_idx=tgt_ignore_idx,
+        )
+        meter_local_hg_baseline.update(local_base_inter, local_base_union, class_id)
 
         before_mask = getattr(model, "last_p1_before_mask", None)
         if before_mask is None:
@@ -161,6 +169,17 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
 
         fg_union = area_union[1].clamp_min(1.0)
         episode_iou = (area_inter[1] / fg_union * 100.0).item()
+        local_baseline_iou = (local_base_inter[1] / local_base_union[1].clamp_min(1.0) * 100.0).item()
+        local_valid = torch.ones_like(pred_mask, dtype=torch.bool) if tgt_ignore_idx is None else ~tgt_ignore_idx
+        local_fg_to_bg = local_baseline_mask.bool() & ~pred_mask.bool() & local_valid
+        local_bg_to_fg = ~local_baseline_mask.bool() & pred_mask.bool() & local_valid
+        local_comparison = {
+            "iou_baseline": float(local_baseline_iou), "iou_active": float(episode_iou),
+            "delta_iou": float(episode_iou - local_baseline_iou),
+            "fg_to_bg_count": int(local_fg_to_bg.sum()), "bg_to_fg_count": int(local_bg_to_fg.sum()),
+            "corrective_flip_count": int((local_fg_to_bg & ~tgt_mask).sum() + (local_bg_to_fg & tgt_mask).sum()),
+            "harmful_flip_count": int((local_fg_to_bg & tgt_mask).sum() + (local_bg_to_fg & ~tgt_mask).sum()),
+        }
         before_iou = (before_inter[1] / before_union[1].clamp_min(1.0) * 100.0).item()
         p1_2_iou = (p1_2_inter[1] / p1_2_union[1].clamp_min(1.0) * 100.0).item()
         before_fg, after_fg = before_mask.bool(), pred_mask.bool()
@@ -181,13 +200,15 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
         prevented_final = p1_2_removed & after_fg
         counterfactual = {"iou_before": float(before_iou), "iou_p1_2": float(p1_2_iou), "iou_after": float(episode_iou), "delta_iou": float(episode_iou - before_iou), "delta_p1_2_vs_before": float(p1_2_iou - before_iou), "delta_p1_3_vs_before": float(episode_iou - before_iou), "delta_p1_3_vs_p1_2": float(episode_iou - p1_2_iou), "flip_count": flip_count, "flip_fraction": float(flip_count / max(1, valid_count)), "fg_to_bg_count": fg_to_bg_count, "bg_to_fg_count": bg_to_fg_count, "p1_2_final_fg_to_bg_count": int(p1_2_removed.sum()), "p1_3_final_fg_to_bg_count": int(p1_3_removed.sum()), "prevented_final_fg_to_bg_count": int(prevented_final.sum()), "protected_true_fg_count": int((prevented_final & tgt_mask).sum()), "protected_false_fg_count": int((prevented_final & (~tgt_mask)).sum()), "fg_to_bg_fraction": float(fg_to_bg_count / max(1, valid_count)), "bg_to_fg_fraction": float(bg_to_fg_count / max(1, valid_count)), "corrective_flip_count": corrective_flip_count, "harmful_flip_count": harmful_flip_count, "corrective_flip_fraction": float(corrective_flip_count / max(1, flip_count)), "harmful_flip_fraction": float(harmful_flip_count / max(1, flip_count)), "net_corrective_flips": corrective_flip_count - harmful_flip_count, "corrective_bg_to_fg": corrective_bg_to_fg, "harmful_bg_to_fg": harmful_bg_to_fg, "corrective_fg_to_bg": corrective_fg_to_bg, "harmful_fg_to_bg": harmful_fg_to_bg}
         analysis = getattr(model, "last_hg_part4_analysis", None)
+        local_hg_analysis = getattr(model, "last_local_hg_analysis", None)
         p1_analysis = getattr(model, "last_p1_diffusion_analysis", None)
         attribution = None  # P1.3-only topology attribution is inactive for P1.2 2-step.
         if analysis is not None:
             component_records.append({"episode_index": int(idx), "class_id": int(class_id[0].item()),
                                       "num_shots": int(len(ref_imgs)), "episode_iou": float(episode_iou), "hg": analysis,
                                       "p1_diffusion": p1_analysis, "p1_1_counterfactual": counterfactual,
-                                      "p1_2_flip_attribution": attribution})
+                                      "p1_2_flip_attribution": attribution,
+                                      "local_hg": local_hg_analysis, "local_hg_comparison": local_comparison})
         # save_episode_visualizations(
         #     reference_image=ref_imgs[0],
         #     reference_mask=ref_masks[0],
@@ -206,9 +227,12 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
 
     # ──────── Final results ────────
     miou = meter.compute_iou()[0].item()
+    miou_local_hg_baseline = meter_local_hg_baseline.compute_iou()[0].item()
     miou_before = meter_before.compute_iou()[0].item()
     miou_p1_2 = meter_p1_2.compute_iou()[0].item()
-    out_str = f'mIoU before = {miou_before:.1f}; P1.2 = {miou_p1_2:.1f}; P1.3 = {miou:.1f}; P1.3-P1.2 = {miou - miou_p1_2:.3f}'
+    out_str = (f'Original Part4 + 3-step P1.2 mIoU = {miou_local_hg_baseline:.3f}; '
+               f'local HG + 3-step P1.2 mIoU = {miou:.3f}; '
+               f'delta = {miou - miou_local_hg_baseline:+.3f}')
     print(out_str)
     with open(log_file, 'a') as fp:
         fp.write(out_str + '\n')
@@ -293,8 +317,36 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
         return {"episode_index": record["episode_index"], "class_id": record["class_id"], "iou_before": cf["iou_before"], "iou_after": cf["iou_after"], "delta_iou": cf["delta_iou"], "removed_patch_count": attr["removed_patch_count"], "corrective_removed_patch_count": attr["corrective_removed_patch_count"], "harmful_removed_patch_count": attr["harmful_removed_patch_count"], "final_corrective_fg_to_bg": cf["corrective_fg_to_bg"], "final_harmful_fg_to_bg": cf["harmful_fg_to_bg"], "sf_harmful_mean": stats["sf"]["harmful"]["mean"], "sbn_harmful_mean": stats["sbn"]["harmful"]["mean"], "cand_harmful_mean": stats["cand_soft"]["harmful"]["mean"], "seed_harmful_mean": stats["seed_prior"]["harmful"]["mean"], "semantic_margin_harmful_mean": stats["semantic_margin"]["harmful"]["mean"], "fg_support_harmful_mean": stats["fg_support_mean"]["harmful"]["mean"], "dissipation_gap_harmful_mean": stats["dissipation_gap"]["harmful"]["mean"]}
     ranked_records = [r for r in component_records if r["p1_2_flip_attribution"] is not None]
     summary["p1_2_flip_attribution_summary"]={"num_episodes":len(ranked_records),"positive_class":"harmful_removed_patch","auc_interpretation":"AUC > 0.5 means higher signal values are more associated with a harmful removal.","pooled_corrective_removed_patch_count":int(sum(r["p1_2_flip_attribution"]["corrective_removed_patch_count"] for r in ranked_records)),"pooled_harmful_removed_patch_count":int(sum(r["p1_2_flip_attribution"]["harmful_removed_patch_count"] for r in ranked_records)),"pooled_corrective_final_fg_to_bg":total_corrective_fg_to_bg,"pooled_harmful_final_fg_to_bg":total_harmful_fg_to_bg,"signals":attribution_signals,"best_auc_signal":best_signal,"best_auc_value":best_auc,"top_harmful_episodes":[episode_card(r) for r in sorted(ranked_records,key=lambda r:r["p1_1_counterfactual"]["delta_iou"])[:20]],"top_beneficial_episodes":[episode_card(r) for r in sorted(ranked_records,key=lambda r:r["p1_1_counterfactual"]["delta_iou"],reverse=True)[:20]]}
+    local_records = [r for r in component_records if r["local_hg"] is not None]
+    local_deltas = np.asarray([r["local_hg_comparison"]["delta_iou"] for r in local_records], dtype=float)
+    local_summary = {
+        "mode": "local_hypergraph_positive_reliability_gate",
+        "baseline_mode": "original_symmetric_hg_gate",
+        "miou_baseline_same_run": float(miou_local_hg_baseline),
+        "miou_active": float(miou),
+        "miou_delta_same_run": float(miou - miou_local_hg_baseline),
+        "episode_delta_mean": float(local_deltas.mean()) if local_deltas.size else None,
+        "episode_delta_median": float(np.median(local_deltas)) if local_deltas.size else None,
+        "improved_episode_fraction": float((local_deltas > 0).mean()) if local_deltas.size else None,
+        "declined_episode_fraction": float((local_deltas < 0).mean()) if local_deltas.size else None,
+        "num_local_hyperedges_mean": float(np.mean([r["local_hg"]["num_local_hyperedges"] for r in local_records])) if local_records else None,
+        "isolated_cluster_fraction_mean": float(np.mean([r["local_hg"]["isolated_cluster_fraction"] for r in local_records])) if local_records else None,
+        "fg_to_bg_total": int(sum(r["local_hg_comparison"]["fg_to_bg_count"] for r in local_records)),
+        "bg_to_fg_total": int(sum(r["local_hg_comparison"]["bg_to_fg_count"] for r in local_records)),
+        "corrective_flip_total": int(sum(r["local_hg_comparison"]["corrective_flip_count"] for r in local_records)),
+        "harmful_flip_total": int(sum(r["local_hg_comparison"]["harmful_flip_count"] for r in local_records)),
+    }
     payload={"component":{"name":"part4_evidence_consistency_hypergraph_gate","mode":"original_symmetric_hg_gate","description":"Part-4 cluster corrections are symmetrically attenuated by an evidence-consistency hypergraph gate.","gate_formula":"gate = 0.5 + 0.5 * raw_reliability","hyperedges":["sf_foreground_support","candidate_support","seed_prior_support"],"gate_range":[.5,1.]},"run":{"dataset":str(args.dataset),"exp_name":str(args.exp_name),"seed":int(args.seed),"num_episodes":len(component_records),"output_dir":str(args.output_dir)},"summary":summary,"episodes":component_records}
-    analysis_path=join(args.output_dir,"hg_part4_component_analysis.json")
+    payload["baseline_component"] = payload["component"]
+    payload["component"] = {"name": "part4_local_hypergraph_positive_reliability_gate", "mode": "local_hypergraph_positive_reliability_gate", "description": "Only spatially adjacent target clusters share hyperedges; DINO similarity weights members. The original Part4 correction is preserved and uncertain positive corrections are attenuated."}
+    payload["summary"] = local_summary
+    payload["episodes"] = [
+        {"episode_index": r["episode_index"], "class_id": r["class_id"],
+         "hg_baseline": r["hg"], "local_hg": r["local_hg"],
+         "local_hg_comparison": r["local_hg_comparison"]}
+        for r in component_records
+    ]
+    analysis_path=join(args.output_dir,"local_hg_part4_analysis.json")
     with open(analysis_path,"w",encoding="utf-8") as fp: json.dump(payload,fp,indent=2,ensure_ascii=False)
     print(f"HG component analysis saved to: {analysis_path}")
     return miou

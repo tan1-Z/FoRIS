@@ -98,6 +98,9 @@ class FoRIS(nn.Module):
 
         self.should_debiass = True
         self.last_hg_part4_analysis = None
+        self.last_local_hg_analysis = None
+        self.last_local_hg_baseline_mask = None
+        self._part4_cluster_state = None
         self.last_p1_diffusion_analysis = None
         self.last_p1_before_mask = None
         self.last_p1_2_mask = None
@@ -217,8 +220,9 @@ class FoRIS(nn.Module):
             w=w,
         )
 
-        # Part 4 — semantic consistency correction
-        score = self._part4_semantic_consistency_correction(
+        # Original Part4 remains the same-run reference and supplies its
+        # calibrated cluster correction to the local hypergraph.
+        score_part4 = self._part4_semantic_consistency_correction(
             score,
             sf=sf,
             sbn=sbn,
@@ -226,6 +230,14 @@ class FoRIS(nn.Module):
             seed_prior=seed_prior,
             tgt_feat=tgt_feat_denoised,
         )
+        baseline_refined = self._p1_uncertainty_gated_anisotropic_diffusion(
+            score_part4, target_feat=tgt_feat_denoised, target_rgb=tgt_image,
+        )
+        baseline_mask = self._binarize_response(
+            baseline_refined, target_hw=(tgt_image.shape[-2], tgt_image.shape[-1]),
+        )
+        self.last_local_hg_baseline_mask = self._finalize_mask(baseline_mask, tgt_image)
+        score = self._part4_local_hypergraph_refinement(score_part4, tgt_feat_denoised)
         score_before_p1 = score.clone()
         score = self._p1_uncertainty_gated_anisotropic_diffusion(
             score,
@@ -1044,6 +1056,7 @@ class FoRIS(nn.Module):
             "negative_delta_change_abs_mean": float((final[neg]-delta_cluster[neg]).abs().mean()) if bool(neg.any()) else 0.0,
             "num_positive_gated_clusters": int(pos.sum()), "num_negative_gated_clusters": int(neg.sum()),
         }
+        self._part4_cluster_state = (labels_t, final, h_t, w_t)
         return final[labels_t].view(h_t, w_t)
 
     def _part4_semantic_consistency_correction(
@@ -1062,4 +1075,92 @@ class FoRIS(nn.Module):
         score = score 
         delta_map = self._semantic_cluster_reweight_map(tgt_feat, sf, sbn, cand_soft, seed_prior)
         return score + delta_map
+
+    def _part4_local_hypergraph_refinement(
+        self, score_part4: torch.Tensor, tgt_feat: torch.Tensor,
+    ) -> torch.Tensor:
+        """Locally gate positive Part4 corrections using group agreement."""
+        labels, old_delta, height, width = self._part4_cluster_state
+        num_clusters = old_delta.numel()
+        labels_hw = labels.view(height, width)
+        adjacency = torch.zeros(
+            (num_clusters, num_clusters), device=labels.device, dtype=torch.bool,
+        )
+        for left, right in (
+            (labels_hw[:, :-1].reshape(-1), labels_hw[:, 1:].reshape(-1)),
+            (labels_hw[:-1, :].reshape(-1), labels_hw[1:, :].reshape(-1)),
+        ):
+            adjacency[left, right] = True
+            adjacency[right, left] = True
+        adjacency.fill_diagonal_(False)
+
+        channels = tgt_feat.shape[1]
+        tokens = F.normalize(
+            tgt_feat[0].permute(1, 2, 0).reshape(-1, channels), p=2, dim=1,
+        )
+        prototypes = compute_cluster_prototypes(tokens, labels, K=num_clusters)
+        similarity = prototypes @ prototypes.T
+        reliability_sum = torch.zeros_like(old_delta)
+        membership_sum = torch.zeros_like(old_delta)
+        edge_sizes: list[int] = []
+        edge_reliabilities: list[torch.Tensor] = []
+        seen: set[tuple[int, ...]] = set()
+
+        for anchor in range(num_clusters):
+            neighbors = torch.nonzero(adjacency[anchor], as_tuple=False).flatten()
+            if neighbors.numel() < 2:
+                continue
+            selected = torch.topk(
+                similarity[anchor, neighbors], k=min(4, neighbors.numel()),
+            ).indices
+            members = torch.cat((neighbors.new_tensor([anchor]), neighbors[selected]))
+            identity = tuple(sorted(members.tolist()))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            # Every member is directly adjacent to the anchor. Similarity is
+            # only a within-local-group weight; it cannot bridge distant areas.
+            weights = ((similarity[anchor, members] + 1.0) * 0.5).clamp(0.0, 1.0)
+            weights[0] = 1.0
+            values = old_delta[members]
+            center = values.median()
+            spread = (values - center).abs().median()
+            amplitude = values.abs().median()
+            coherence = (1.0 - spread / (amplitude + 1e-8)).clamp(0.0, 1.0)
+            sign_agreement = (
+                weights * (torch.sign(values) == torch.sign(center)).to(weights.dtype)
+            ).sum() / weights.sum().clamp_min(1e-8)
+            reliability = coherence * sign_agreement
+            reliability_sum.index_add_(0, members, weights * reliability)
+            membership_sum.index_add_(0, members, weights)
+            edge_sizes.append(int(members.numel()))
+            edge_reliabilities.append(reliability)
+
+        local_reliability = torch.where(
+            membership_sum > 1e-8,
+            reliability_sum / membership_sum.clamp_min(1e-8),
+            torch.ones_like(old_delta),
+        ).clamp(0.0, 1.0)
+        # Keep calibrated negative corrections; attenuate only uncertain
+        # positive reinforcement to limit perturbation of the old score scale.
+        new_delta = torch.where(
+            old_delta > 0,
+            old_delta * (0.5 + 0.5 * local_reliability),
+            old_delta,
+        )
+        adjustment = (new_delta - old_delta)[labels].view(height, width)
+        self.last_local_hg_analysis = {
+            "mode": "local_hypergraph_positive_reliability_gate",
+            "num_clusters": num_clusters,
+            "num_local_hyperedges": len(edge_sizes),
+            "mean_edge_size": float(sum(edge_sizes) / len(edge_sizes)) if edge_sizes else 0.0,
+            "max_edge_size": max(edge_sizes, default=0),
+            "isolated_cluster_fraction": float((membership_sum <= 1e-8).float().mean()),
+            "mean_edge_reliability": float(torch.stack(edge_reliabilities).mean()) if edge_reliabilities else None,
+            "positive_cluster_count": int((old_delta > 0).sum()),
+            "negative_cluster_change_abs_max": float((new_delta[old_delta < 0] - old_delta[old_delta < 0]).abs().max()) if bool((old_delta < 0).any()) else 0.0,
+            "positive_attenuation_abs_mean": float((new_delta - old_delta).abs().mean()),
+            "adjustment_abs_max": float(adjustment.abs().max()),
+        }
+        return score_part4 + adjustment
 

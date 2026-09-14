@@ -104,7 +104,10 @@ class HyperFoRIS(nn.Module):
         _, _, channels, height, width = features.shape
         ref_features = F.normalize(features[0, :shots], p=2, dim=1)
         query_features = F.normalize(features[0, shots], p=2, dim=0)
-        occupancy = F.interpolate(ref_masks.float(), size=(height, width), mode="area").squeeze(1).clamp(0, 1)
+        # ref_masks is [S, H, W]; interpolate requires an explicit channel.
+        occupancy = F.interpolate(
+            ref_masks.float().unsqueeze(1), size=(height, width), mode="area",
+        ).squeeze(1).clamp(0, 1)
         ref_nodes = ref_features.permute(0, 2, 3, 1).reshape(-1, channels)
         query_nodes = query_features.permute(1, 2, 0).reshape(-1, channels)
         ref_occupancy = occupancy.reshape(-1)

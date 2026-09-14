@@ -320,7 +320,7 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
     local_records = [r for r in component_records if r["local_hg"] is not None]
     local_deltas = np.asarray([r["local_hg_comparison"]["delta_iou"] for r in local_records], dtype=float)
     local_summary = {
-        "mode": "local_hypergraph_positive_reliability_gate",
+        "mode": "local_hypergraph_all_correction_reliability_gate",
         "baseline_mode": "original_symmetric_hg_gate",
         "miou_baseline_same_run": float(miou_local_hg_baseline),
         "miou_active": float(miou),
@@ -338,7 +338,7 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
     }
     payload={"component":{"name":"part4_evidence_consistency_hypergraph_gate","mode":"original_symmetric_hg_gate","description":"Part-4 cluster corrections are symmetrically attenuated by an evidence-consistency hypergraph gate.","gate_formula":"gate = 0.5 + 0.5 * raw_reliability","hyperedges":["sf_foreground_support","candidate_support","seed_prior_support"],"gate_range":[.5,1.]},"run":{"dataset":str(args.dataset),"exp_name":str(args.exp_name),"seed":int(args.seed),"num_episodes":len(component_records),"output_dir":str(args.output_dir)},"summary":summary,"episodes":component_records}
     payload["baseline_component"] = payload["component"]
-    payload["component"] = {"name": "part4_local_hypergraph_positive_reliability_gate", "mode": "local_hypergraph_positive_reliability_gate", "description": "Only spatially adjacent target clusters share hyperedges; DINO similarity weights members. The original Part4 correction is preserved and uncertain positive corrections are attenuated."}
+    payload["component"] = {"name": "part4_local_hypergraph_all_correction_reliability_gate", "mode": "local_hypergraph_all_correction_reliability_gate", "description": "Only spatially adjacent target clusters share hyperedges; DINO similarity weights members. The original Part4 correction keeps its sign while local reliability attenuates every nonzero correction."}
     payload["summary"] = local_summary
     payload["episodes"] = [
         {"episode_index": r["episode_index"], "class_id": r["class_id"],

@@ -1141,16 +1141,18 @@ class FoRIS(nn.Module):
             reliability_sum / membership_sum.clamp_min(1e-8),
             torch.ones_like(old_delta),
         ).clamp(0.0, 1.0)
-        # Keep calibrated negative corrections; attenuate only uncertain
-        # positive reinforcement to limit perturbation of the old score scale.
+        # L1: all nonzero original corrections keep their sign. Local HG only
+        # controls retained magnitude, so it cannot introduce a new correction
+        # direction or overwrite the calibrated Part4 correction scale.
+        retained_scale = 0.5 + 0.5 * local_reliability
         new_delta = torch.where(
-            old_delta > 0,
-            old_delta * (0.5 + 0.5 * local_reliability),
+            old_delta != 0,
+            old_delta * retained_scale,
             old_delta,
         )
         adjustment = (new_delta - old_delta)[labels].view(height, width)
         self.last_local_hg_analysis = {
-            "mode": "local_hypergraph_positive_reliability_gate",
+            "mode": "local_hypergraph_all_correction_reliability_gate",
             "num_clusters": num_clusters,
             "num_local_hyperedges": len(edge_sizes),
             "mean_edge_size": float(sum(edge_sizes) / len(edge_sizes)) if edge_sizes else 0.0,
@@ -1158,8 +1160,10 @@ class FoRIS(nn.Module):
             "isolated_cluster_fraction": float((membership_sum <= 1e-8).float().mean()),
             "mean_edge_reliability": float(torch.stack(edge_reliabilities).mean()) if edge_reliabilities else None,
             "positive_cluster_count": int((old_delta > 0).sum()),
-            "negative_cluster_change_abs_max": float((new_delta[old_delta < 0] - old_delta[old_delta < 0]).abs().max()) if bool((old_delta < 0).any()) else 0.0,
-            "positive_attenuation_abs_mean": float((new_delta - old_delta).abs().mean()),
+            "negative_cluster_count": int((old_delta < 0).sum()),
+            "positive_attenuation_abs_mean": float((new_delta[old_delta > 0] - old_delta[old_delta > 0]).abs().mean()) if bool((old_delta > 0).any()) else 0.0,
+            "negative_attenuation_abs_mean": float((new_delta[old_delta < 0] - old_delta[old_delta < 0]).abs().mean()) if bool((old_delta < 0).any()) else 0.0,
+            "sign_flip_count": int(((torch.sign(new_delta) != torch.sign(old_delta)) & (old_delta != 0)).sum()),
             "adjustment_abs_max": float(adjustment.abs().max()),
         }
         return score_part4 + adjustment

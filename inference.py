@@ -208,7 +208,7 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
     miou = meter.compute_iou()[0].item()
     miou_before = meter_before.compute_iou()[0].item()
     miou_p1_2 = meter_p1_2.compute_iou()[0].item()
-    out_str = f'mIoU before = {miou_before:.1f}; P1.2 = {miou_p1_2:.1f}; P1.3 = {miou:.1f}; P1.3-P1.2 = {miou - miou_p1_2:.3f}'
+    out_str = f'mIoU before = {miou_before:.1f}; P1.2 step-1 = {miou_p1_2:.1f}; P1.2 step-2 = {miou:.1f}; delta = {miou - miou_p1_2:.3f}'
     print(out_str)
     with open(log_file, 'a') as fp:
         fp.write(out_str + '\n')

@@ -6,7 +6,6 @@ import torch
 
 # from models.insid3 import INSID3
 from models.foris import FoRIS
-from models.hyperforis import HyperFoRIS
 
 _HUB_NAMES = {
     "small": "dinov3_vits16",
@@ -113,28 +112,6 @@ def build_foris(
 
 
 def build_foris_from_args(args):
-    if getattr(args, "method", "foris") == "hyperforis":
-        encoder = _build_encoder(args.model_size, dinov3_repo=args.dinov3_repo, weights=args.weights)
-        model = HyperFoRIS(
-            encoder=encoder,
-            image_size=args.image_size,
-            mask_refiner='crf' if getattr(args, 'crf_mask_refinement', False) else 'bilinear',
-            resize_to_orig_size=False,
-            device=args.device,
-            semantic_k=args.semantic_k,
-            semantic_threshold=args.semantic_threshold,
-            spatial_radius=args.spatial_radius,
-            cross_topk=args.cross_topk,
-            background_modes=args.background_modes,
-            propagation_steps=args.propagation_steps,
-            propagation_alpha=args.propagation_alpha,
-            background_score_weight=args.background_score_weight,
-            use_topology_hyperedges=args.use_topology_hyperedges,
-            adaptive_relation_weights=args.adaptive_relation_weights,
-        )
-        for param in model.parameters():
-            param.requires_grad = False
-        return model
     ids = None if not args.multilayer_ids else [int(x.strip()) for x in args.multilayer_ids.split(",") if x.strip()]
     return build_foris(
         model_size=args.model_size,

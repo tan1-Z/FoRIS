@@ -98,9 +98,6 @@ class FoRIS(nn.Module):
 
         self.should_debiass = True
         self.last_hg_part4_analysis = None
-        self.last_ref_target_hg_analysis = None
-        self.last_ref_target_hg_baseline_mask = None
-        self._part4_cluster_state = None
         self.last_p1_diffusion_analysis = None
         self.last_p1_before_mask = None
         self.last_p1_2_mask = None
@@ -220,27 +217,14 @@ class FoRIS(nn.Module):
             w=w,
         )
 
-        # Same-run original Part4 branch.
-        score_part4 = self._part4_semantic_consistency_correction(
+        # Part 4 — semantic consistency correction
+        score = self._part4_semantic_consistency_correction(
             score,
             sf=sf,
             sbn=sbn,
             cand_soft=cand_soft,
             seed_prior=seed_prior,
             tgt_feat=tgt_feat_denoised,
-        )
-        baseline_refined = self._p1_uncertainty_gated_anisotropic_diffusion(
-            score_part4, target_feat=tgt_feat_denoised, target_rgb=tgt_image,
-        )
-        baseline_mask = self._binarize_response(
-            baseline_refined, target_hw=(tgt_image.shape[-2], tgt_image.shape[-1]),
-        )
-        self.last_ref_target_hg_baseline_mask = self._finalize_mask(baseline_mask, tgt_image)
-
-        # Active branch: reference-FG / target-cluster hypergraph residual.
-        score = self._part4_reference_target_fg_hypergraph(
-            score_part4, ref_feats=fmaps_norm[:, :S], ref_masks=ref_masks,
-            tgt_feat=tgt_feat_denoised, n_refs=S,
         )
         score_before_p1 = score.clone()
         score = self._p1_uncertainty_gated_anisotropic_diffusion(
@@ -1060,7 +1044,6 @@ class FoRIS(nn.Module):
             "negative_delta_change_abs_mean": float((final[neg]-delta_cluster[neg]).abs().mean()) if bool(neg.any()) else 0.0,
             "num_positive_gated_clusters": int(pos.sum()), "num_negative_gated_clusters": int(neg.sum()),
         }
-        self._part4_cluster_state = (labels_t, final, h_t, w_t)
         return final[labels_t].view(h_t, w_t)
 
     def _part4_semantic_consistency_correction(
@@ -1079,81 +1062,4 @@ class FoRIS(nn.Module):
         score = score 
         delta_map = self._semantic_cluster_reweight_map(tgt_feat, sf, sbn, cand_soft, seed_prior)
         return score + delta_map
-
-    def _part4_reference_target_fg_hypergraph(
-        self,
-        score_part4: torch.Tensor,
-        *,
-        ref_feats: torch.Tensor,
-        ref_masks: torch.Tensor,
-        tgt_feat: torch.Tensor,
-        n_refs: int,
-    ) -> torch.Tensor:
-        """Add reference-FG group support to existing positive Part4 corrections."""
-        labels, old_delta, height, width = self._part4_cluster_state
-        num_target = old_delta.numel()
-        ref_tokens: list[torch.Tensor] = []
-        for shot in range(n_refs):
-            mask = downsample_mask(ref_masks[shot:shot + 1], height, width)
-            tokens = ref_feats[0, shot][:, mask].transpose(0, 1)
-            if tokens.numel() > 0:
-                ref_tokens.append(F.normalize(tokens, p=2, dim=1))
-        if not ref_tokens or int((old_delta > 0).sum()) < 2:
-            self.last_ref_target_hg_analysis = {
-                "mode": "reference_target_fg_hypergraph_residual",
-                "num_reference_fg_clusters": 0, "num_hyperedges": 0,
-                "affected_target_clusters": 0, "fallback": True,
-            }
-            return score_part4
-
-        ref_tokens_cat = torch.cat(ref_tokens, dim=0)
-        ref_labels = agglomerative_clustering(ref_tokens_cat, tau=self.tau)
-        num_reference = int(ref_labels.max().item()) + 1
-        ref_prototypes = compute_cluster_prototypes(ref_tokens_cat, ref_labels, K=num_reference)
-        channels = tgt_feat.shape[1]
-        target_tokens = F.normalize(
-            tgt_feat[0].permute(1, 2, 0).reshape(-1, channels), p=2, dim=1,
-        )
-        target_prototypes = compute_cluster_prototypes(target_tokens, labels, K=num_target)
-        eligible = old_delta > 0
-        residual_sum = torch.zeros_like(old_delta)
-        residual_weight = torch.zeros_like(old_delta)
-        edge_reliabilities: list[torch.Tensor] = []
-        edge_sizes: list[int] = []
-        for prototype in ref_prototypes:
-            similarity = target_prototypes @ prototype
-            candidates = torch.nonzero(eligible, as_tuple=False).flatten()
-            if candidates.numel() < 2:
-                continue
-            chosen = torch.topk(similarity[candidates], k=min(4, candidates.numel())).indices
-            members = candidates[chosen]
-            support = ((similarity[members] + 1.0) * 0.5).clamp(0.0, 1.0)
-            center = support.median()
-            spread = (support - center).abs().median()
-            reliability = (1.0 - spread / (center.abs() + 1e-8)).clamp(0.0, 1.0)
-            # The residual uses the existing foreground-boost ceiling. This is
-            # deliberately large enough to test cross-image group support.
-            residual = self.semantic_cluster_fg_boost * reliability * support
-            residual_sum.index_add_(0, members, residual)
-            residual_weight.index_add_(0, members, torch.ones_like(residual))
-            edge_reliabilities.append(reliability)
-            edge_sizes.append(int(members.numel()) + 1)  # reference cluster + targets
-
-        residual_cluster = residual_sum / residual_weight.clamp_min(1.0)
-        residual_cluster = torch.where(eligible, residual_cluster, torch.zeros_like(residual_cluster))
-        adjustment = residual_cluster[labels].view(height, width)
-        self.last_ref_target_hg_analysis = {
-            "mode": "reference_target_fg_hypergraph_residual",
-            "num_reference_fg_clusters": num_reference,
-            "num_hyperedges": len(edge_sizes),
-            "mean_hyperedge_size": float(sum(edge_sizes) / len(edge_sizes)) if edge_sizes else 0.0,
-            "max_hyperedge_size": max(edge_sizes, default=0),
-            "mean_edge_reliability": float(torch.stack(edge_reliabilities).mean()) if edge_reliabilities else None,
-            "affected_target_clusters": int((residual_cluster > 0).sum()),
-            "residual_cluster_mean": float(residual_cluster.mean()),
-            "residual_cluster_max": float(residual_cluster.max()),
-            "residual_abs_mean": float(adjustment.abs().mean()),
-            "fallback": len(edge_sizes) == 0,
-        }
-        return score_part4 + adjustment
 

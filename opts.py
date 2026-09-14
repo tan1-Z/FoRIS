@@ -33,22 +33,6 @@ def get_args_parser() -> argparse.ArgumentParser:
                         help="Local DINOv3 repository; defaults to DINOV3_REPO or GitHub.")
     parser.add_argument("--weights", default=None,
                         help="DINOv3 checkpoint; defaults to DINOV3_WEIGHTS or pretrain/.")
-    parser.add_argument("--method", default="foris", choices=["foris", "hyperforis"],
-                        help="Inference pipeline: original FoRIS or HyperFoRIS.")
-    parser.add_argument("--hyper-layers", default="last",
-                        help="Reserved configurable DINO layer set for HyperFoRIS, e.g. 17,20,23.")
-    parser.add_argument("--layer-temperature", default=0.5, type=float,
-                        help="Reserved HyperFoRIS adaptive layer-fusion temperature.")
-    parser.add_argument("--semantic-k", default=8, type=int)
-    parser.add_argument("--semantic-threshold", default=0.15, type=float)
-    parser.add_argument("--spatial-radius", default=1, type=int)
-    parser.add_argument("--cross-topk", default=4, type=int)
-    parser.add_argument("--background-modes", default=8, type=int)
-    parser.add_argument("--propagation-steps", default=4, type=int)
-    parser.add_argument("--propagation-alpha", default=0.85, type=float)
-    parser.add_argument("--background-score-weight", default=1.0, type=float)
-    parser.add_argument("--use-topology-hyperedges", action="store_true")
-    parser.add_argument("--adaptive-relation-weights", action="store_true")
     # Adaptive Multi-Level + Local Token Refinement (all opt-in for baseline ablations).
     parser.add_argument("--adaptive_multilayer", action="store_true")
     parser.add_argument("--multilayer_ids", default=None,

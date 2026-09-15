@@ -97,11 +97,6 @@ class FoRIS(nn.Module):
         self._orig_tgt_size = None
 
         self.should_debiass = True
-        self.last_hg_part4_analysis = None
-        self.last_p1_diffusion_analysis = None
-        self.last_p1_before_mask = None
-        self.last_p1_2_mask = None
-        self.last_p1_patch_attribution_state = None
 
     # ──────────────────────── Public API ────────────────────────
 
@@ -226,26 +221,6 @@ class FoRIS(nn.Module):
             seed_prior=seed_prior,
             tgt_feat=tgt_feat_denoised,
         )
-        score_before_p1 = score.clone()
-        score = self._p1_uncertainty_gated_anisotropic_diffusion(
-            score,
-            target_feat=tgt_feat_denoised,
-            target_rgb=tgt_image,
-        )
-        self.last_p1_patch_attribution_state.update({
-            "sf": sf.detach(), "sbn": sbn.detach(), "cand_soft": cand_soft.detach(),
-            "seed_prior": seed_prior.detach(),
-        })
-        before_mask = self._binarize_response(
-            score_before_p1,
-            target_hw=(tgt_image.shape[-2], tgt_image.shape[-1]),
-        )
-        self.last_p1_before_mask = self._finalize_mask(before_mask, tgt_image)
-        p1_2_mask = self._binarize_response(
-            self.last_p1_patch_attribution_state["score_p1_2"].squeeze(0),
-            target_hw=(tgt_image.shape[-2], tgt_image.shape[-1]),
-        )
-        self.last_p1_2_mask = self._finalize_mask(p1_2_mask, tgt_image)
 
         denoised_mask = self._binarize_response(
             score,
@@ -291,136 +266,6 @@ class FoRIS(nn.Module):
         if self.resize_to_orig_size:
             up = upsample_mask(up, self._orig_tgt_size[0], self._orig_tgt_size[1])
         return up
-
-    def _p1_uncertainty_gated_anisotropic_diffusion(
-        self,
-        score_part4: torch.Tensor,
-        *,
-        target_feat: torch.Tensor,
-        target_rgb: torch.Tensor,
-    ) -> torch.Tensor:
-        """One 4-neighbor, uncertainty-gated anisotropic diffusion step."""
-        score_raw = score_part4.unsqueeze(0) if score_part4.ndim == 2 else score_part4
-        _, h, w = score_raw.shape
-        score_min, score_max = score_raw.amin(), score_raw.amax()
-        score_range = score_max - score_min
-        score_norm = (score_raw - score_min) / score_range.clamp_min(1e-6)
-        feat = F.normalize(target_feat, p=2, dim=1)
-        rgb = F.interpolate(
-            denormalize(target_rgb).clamp(0.0, 1.0),
-            size=(h, w), mode="bilinear", align_corners=False,
-        )
-
-        d_feat_lr = (1.0 - (feat[:, :, :, :-1] * feat[:, :, :, 1:]).sum(dim=1)).clamp_min(0.0)
-        d_feat_ud = (1.0 - (feat[:, :, :-1, :] * feat[:, :, 1:, :]).sum(dim=1)).clamp_min(0.0)
-        d_rgb_lr = (rgb[:, :, :, :-1] - rgb[:, :, :, 1:]).pow(2).sum(dim=1)
-        d_rgb_ud = (rgb[:, :, :-1, :] - rgb[:, :, 1:, :]).pow(2).sum(dim=1)
-        sigma_feat = torch.cat([d_feat_lr.reshape(-1), d_feat_ud.reshape(-1)]).median().clamp_min(1e-6)
-        sigma_rgb = torch.cat([d_rgb_lr.reshape(-1), d_rgb_ud.reshape(-1)]).median().clamp_min(1e-6)
-        c_lr = torch.exp(-d_feat_lr / sigma_feat - d_rgb_lr / sigma_rgb)
-        c_ud = torch.exp(-d_feat_ud / sigma_feat - d_rgb_ud / sigma_rgb)
-
-        weighted_neighbor_sum = torch.zeros_like(score_norm)
-        conductance_sum = torch.zeros_like(score_norm)
-        weighted_neighbor_sum[:, :, :-1] += c_lr * score_norm[:, :, 1:]
-        weighted_neighbor_sum[:, :, 1:] += c_lr * score_norm[:, :, :-1]
-        conductance_sum[:, :, :-1] += c_lr
-        conductance_sum[:, :, 1:] += c_lr
-        weighted_neighbor_sum[:, :-1, :] += c_ud * score_norm[:, 1:, :]
-        weighted_neighbor_sum[:, 1:, :] += c_ud * score_norm[:, :-1, :]
-        conductance_sum[:, :-1, :] += c_ud
-        conductance_sum[:, 1:, :] += c_ud
-        neighbor_mean = torch.where(
-            conductance_sum > 1e-8,
-            weighted_neighbor_sum / conductance_sum.clamp_min(1e-8),
-            score_norm,
-        )
-
-        confidence = (2.0 * score_norm - 1.0).abs().clamp(0.0, 1.0)
-        score_norm_symmetric = confidence * score_norm + (1.0 - confidence) * neighbor_mean
-        step1_dissipation = (1.0 - confidence) * (score_norm - neighbor_mean).clamp_min(0.0)
-        score_norm_p1_2 = score_norm - step1_dissipation
-        def neighbor_for(field):
-            weighted = torch.zeros_like(field)
-            weighted[:, :, :-1] += c_lr * field[:, :, 1:]; weighted[:, :, 1:] += c_lr * field[:, :, :-1]
-            weighted[:, :-1, :] += c_ud * field[:, 1:, :]; weighted[:, 1:, :] += c_ud * field[:, :-1, :]
-            return torch.where(conductance_sum > 1e-8, weighted / conductance_sum.clamp_min(1e-8), field)
-        neighbor_mean_step2 = neighbor_for(score_norm_p1_2)
-        confidence_step2 = (2.0 * score_norm_p1_2 - 1.0).abs().clamp(0.0, 1.0)
-        step2_dissipation = (1.0 - confidence_step2) * (score_norm_p1_2 - neighbor_mean_step2).clamp_min(0.0)
-        score_norm_p1 = score_norm_p1_2 - step2_dissipation
-        score_p1_2 = score_raw if bool(score_range <= 1e-6) else score_min + score_range * score_norm_p1_2
-        score_p1 = score_raw if bool(score_range <= 1e-6) else score_min + score_range * score_norm_p1
-
-        conductance = torch.cat([c_lr.reshape(-1), c_ud.reshape(-1)])
-        upward_candidate = score_norm_symmetric > score_norm
-        downward_candidate = score_norm_symmetric < score_norm
-        rejected_upward = (score_norm_symmetric - score_norm).clamp_min(0.0)
-        accepted_dissipation = (score_norm - score_norm_p1).clamp_min(0.0)
-        before_patch = score_norm > 0.5
-        after_patch = score_norm_p1 > 0.5
-        patch_fg_to_bg = before_patch & (~after_patch)
-        patch_bg_to_fg = (~before_patch) & after_patch
-        monotonicity_violation = score_norm_p1 > score_norm + 1e-7
-        if bool(patch_bg_to_fg.any()):
-            raise RuntimeError("P1.2 monotonicity violation: patch BG->FG flip detected.")
-        self.last_p1_diffusion_analysis = {
-            "mode": "p1_2_two_step_one_sided_dissipation",
-            "raw_score_min": float(score_min),
-            "raw_score_max": float(score_max),
-            "raw_score_range": float(score_range),
-            "normalized_score_mean": float(score_norm.mean()),
-            "normalized_confidence_mean": float(confidence.mean()),
-            "normalized_low_conf_fraction": float((confidence < 0.5).float().mean()),
-            "score_norm_change_abs_mean": float((score_norm_p1 - score_norm).abs().mean()),
-            "score_norm_change_abs_max": float((score_norm_p1 - score_norm).abs().max()),
-            "raw_score_change_abs_mean": float((score_p1 - score_raw).abs().mean()),
-            "raw_score_change_abs_max": float((score_p1 - score_raw).abs().max()),
-            "score_before_mean": float(score_raw.mean()),
-            "score_after_mean": float(score_p1.mean()),
-            "score_change_abs_mean": float((score_p1 - score_raw).abs().mean()),
-            "score_change_abs_max": float((score_p1 - score_raw).abs().max()),
-            "confidence_mean": float(confidence.mean()),
-            "conductance_mean": float(conductance.mean()),
-            "conductance_std": float(conductance.std(unbiased=False)),
-            "sigma_feat": float(sigma_feat),
-            "sigma_rgb": float(sigma_rgb),
-            "neighbor_mean_minus_score_abs_mean": float((neighbor_mean - score_norm).abs().mean()),
-            "patch_threshold_flip_count": int((before_patch != after_patch).sum()),
-            "patch_threshold_flip_fraction": float((before_patch != after_patch).float().mean()),
-            "threshold_flip_count": int((before_patch != after_patch).sum()),
-            "threshold_flip_fraction": float((before_patch != after_patch).float().mean()),
-            "low_conf_fraction": float((confidence < 0.5).float().mean()),
-            "anchor_min_error": float(score_norm_p1.reshape(-1)[score_raw.argmin()].abs()),
-            "anchor_max_error": float((score_norm_p1.reshape(-1)[score_raw.argmax()] - 1.0).abs()),
-            "upward_candidate_fraction": float(upward_candidate.float().mean()),
-            "downward_candidate_fraction": float(downward_candidate.float().mean()),
-            "unchanged_candidate_fraction": float((~(upward_candidate | downward_candidate)).float().mean()),
-            "upward_candidate_abs_mean": float(rejected_upward.mean()),
-            "downward_candidate_abs_mean": float((score_norm - score_norm_symmetric).clamp_min(0.0).mean()),
-            "rejected_upward_abs_mean": float(rejected_upward.mean()),
-            "rejected_upward_abs_max": float(rejected_upward.max()),
-            "accepted_dissipation_mean": float(accepted_dissipation.mean()),
-            "accepted_dissipation_max": float(accepted_dissipation.max()),
-            "patch_fg_to_bg_count": int(patch_fg_to_bg.sum()),
-            "patch_bg_to_fg_count": int(patch_bg_to_fg.sum()),
-            "monotonicity_violation_count": int(monotonicity_violation.sum()),
-            "monotonicity_violation_max": float((score_norm_p1 - score_norm).clamp_min(0.0).max()),
-            "step1_dissipation_mean": float(step1_dissipation.mean()), "step1_dissipation_max": float(step1_dissipation.max()),
-            "step2_dissipation_mean": float(step2_dissipation.mean()), "step2_dissipation_max": float(step2_dissipation.max()),
-            "step2_to_step1_dissipation_ratio": None if float(step1_dissipation.mean()) <= 1e-8 else float(step2_dissipation.mean() / step1_dissipation.mean()),
-            "step1_monotonicity_violation_count": int((score_norm_p1_2 > score_norm + 1e-7).sum()), "step2_monotonicity_violation_count": int((score_norm_p1 > score_norm_p1_2 + 1e-7).sum()),
-            "core_protection_mean_fg": 0.0, "dissipation_reduction_mean": 0.0,
-            "p1_2_lower_bound_violation_count": 0,
-        }
-        self.last_p1_patch_attribution_state = {
-            "score_norm": score_norm.detach(), "score_norm_p1": score_norm_p1.detach(),
-            "confidence": confidence.detach(), "neighbor_mean_norm": neighbor_mean.detach(),
-            "score_norm_p1_2": score_norm_p1_2.detach(), "score_p1_2": score_p1_2.detach(),
-            "step1_dissipation": step1_dissipation.detach(), "step2_dissipation": step2_dissipation.detach(),
-            "fg_neighbor_count": torch.zeros_like(score_norm, dtype=torch.long),
-        }
-        return score_p1.squeeze(0) if score_part4.ndim == 2 else score_p1
 
     # ══════════════════════════════════════════════════════════════════════
     # Part 1: Positional debiasing (是否去除位置偏置)
@@ -733,54 +578,23 @@ class FoRIS(nn.Module):
         dtype = tgt_feat.dtype
         tgt_norm = F.normalize(tgt_feat, p=2, dim=1)
 
-        # Soft top-k foreground evidence: preserve the original affinity and
-        # normalization path, changing only top-1 binary voting.
-        soft_sum = torch.zeros((h, w), dtype=dtype, device=device)
-        temperature = max(1e-4, float(self.cluster_logsumexp_temp))
-        yy, xx = torch.meshgrid(
-            torch.arange(h, device=device),
-            torch.arange(w, device=device),
-            indexing="ij",
-        )
-        yy, xx = yy.unsqueeze(-1), xx.unsqueeze(-1)
-        mutual_radius = 1
+        votes = torch.zeros((h, w), dtype=torch.int32, device=device)
         for m in range(n_refs):
-            # [1, C, H, W]: normalize each reference patch over feature channels,
-            # matching target normalization and making the affinity a cosine score.
+            # [1, C, H, W]: match target's per-patch channel normalization.
             ref_m = F.normalize(ref_feats[0:1, m], p=2, dim=1)
             sim_m = torch.einsum("bchw,bcxy->bhwxy", ref_m, tgt_norm)
             sim0 = sim_m[0]
             Hs, Ws = sim0.shape[:2]
             sim_t_to_r = sim0.permute(2, 3, 0, 1)
-            sim_flat = sim_t_to_r.reshape(h, w, -1)
-            k_eff = min(5, Hs * Ws)
-            topk_vals, topk_idx = torch.topk(sim_flat, k=k_eff, dim=-1)
+            best_idx = sim_t_to_r.reshape(h, w, -1).argmax(dim=2)
+            rows = best_idx // Ws
+            cols = best_idx % Ws
             ref_mask_m = downsample_mask(ref_masks[m : m + 1], Hs, Ws).squeeze(0)
-            topk_mask = ref_mask_m.reshape(-1)[topk_idx].to(dtype=dtype)
-            weights = torch.softmax(topk_vals / temperature, dim=-1)
-            support_soft_c1 = (weights * topk_mask).sum(dim=-1)
+            votes += ref_mask_m[rows, cols].to(torch.int32)
 
-            # Reuse sim0 for a single reverse argmax; no second affinity is made.
-            back_best_idx = sim0.reshape(Hs * Ws, h * w).argmax(dim=-1)
-            topk_back_idx = back_best_idx[topk_idx]
-            back_rows, back_cols = topk_back_idx // w, topk_back_idx % w
-            mutual_mask = (
-                (back_rows - yy).abs() <= mutual_radius
-            ) & ((back_cols - xx).abs() <= mutual_radius)
-            mutual_weights = weights * mutual_mask.to(dtype=weights.dtype)
-            mutual_mass = mutual_weights.sum(dim=-1, keepdim=True)
-            weights_mutual = mutual_weights / mutual_mass.clamp_min(1e-8)
-            support_soft_mutual = (weights_mutual * topk_mask).sum(dim=-1)
-            support_soft = torch.where(
-                mutual_mass.squeeze(-1) > 1e-8,
-                support_soft_mutual,
-                support_soft_c1,
-            )
-            soft_sum += support_soft
+        candidates_mask = votes >= math.ceil(n_refs / 2)
 
-        vote_soft = (soft_sum / float(max(1, n_refs))).clamp(0.0, 1.0)
-        candidate_threshold = math.ceil(n_refs / 2) / float(max(1, n_refs))
-        candidates_mask = vote_soft >= candidate_threshold
+        vote_soft = votes.to(dtype=dtype) / float(max(1, n_refs))
 
         return candidates_mask,  vote_soft
 
@@ -973,8 +787,6 @@ class FoRIS(nn.Module):
         tgt_feat: torch.Tensor,
         sf: torch.Tensor,
         sbn: torch.Tensor,
-        cand_soft: torch.Tensor,
-        seed_prior: torch.Tensor,
     ) -> torch.Tensor:
         """Cluster-level boost for pure-fg clusters, suppress conflicted clusters."""
         _, c_t, h_t, w_t = tgt_feat.shape
@@ -983,11 +795,9 @@ class FoRIS(nn.Module):
         labels_t = agglomerative_clustering(xt, tau=self.tau)
         k_t = int(labels_t.max().item()) + 1
 
-        sf_flat, sb_flat = sf.reshape(-1), sbn.reshape(-1)
-        cand_flat, seed_flat = cand_soft.reshape(-1), seed_prior.reshape(-1)
+        sf_flat = sf.reshape(-1)
+        sb_flat = sbn.reshape(-1)
         delta_cluster = torch.zeros(k_t, device=sf.device, dtype=sf.dtype)
-        cluster_sf = torch.zeros_like(delta_cluster); cluster_sb = torch.zeros_like(delta_cluster)
-        cluster_cand = torch.zeros_like(delta_cluster); cluster_seed = torch.zeros_like(delta_cluster)
 
         for k_idx in range(k_t):
             mk = labels_t == k_idx
@@ -995,8 +805,6 @@ class FoRIS(nn.Module):
                 continue
             fg_mean = sf_flat[mk].mean()
             bg_mean = sb_flat[mk].mean()
-            cluster_sf[k_idx], cluster_sb[k_idx] = fg_mean, bg_mean
-            cluster_cand[k_idx], cluster_seed[k_idx] = cand_flat[mk].mean(), seed_flat[mk].mean()
             fg_pure = (fg_mean - bg_mean).clamp_min(0.0)
             conflict = torch.minimum(fg_mean, bg_mean)
             delta_k = (
@@ -1004,43 +812,8 @@ class FoRIS(nn.Module):
                 - self.semantic_cluster_conflict_suppress * conflict
             )
             delta_cluster[k_idx] = delta_k.clamp_min(-self.semantic_cluster_neg_cap)
-        H = torch.stack([(2*(cluster_sf-.5)).clamp(0,1), (2*(cluster_cand-.5)).clamp(0,1), (2*(cluster_seed-.5)).clamp(0,1)], 1)
-        degrees = H.sum(0); valid = degrees > 1e-8
-        if bool(valid.any()):
-            Hv = H[:, valid]; ed = Hv.sum(0).clamp_min(1e-8); nd = Hv.sum(1).clamp_min(1e-8)
-            base = (Hv / ed.unsqueeze(0)) @ Hv.T; inv = nd.rsqrt()
-            theta = inv.unsqueeze(1) * base * inv.unsqueeze(0)
-            direct = Hv.mean(1); group = theta @ direct
-            raw_reliability = (.5 * direct + .5 * group).clamp(0, 1)
-            gate = (.5 + .5 * raw_reliability).clamp(.5, 1)
-            formula_error = float((gate - (.5 + .5 * raw_reliability).clamp(.5, 1)).abs().max())
-        else:
-            direct = group = raw_reliability = torch.zeros_like(delta_cluster); gate = torch.ones_like(delta_cluster); formula_error = 0.0
-        final = gate * delta_cluster
-        pos, neg = delta_cluster > 0, delta_cluster < 0
-        mean_if = lambda x, m: float(x[m].abs().mean()) if bool(m.any()) else 0.0
-        base_sum = delta_cluster.abs().sum()
-        pos_ret = float(final[pos].abs().sum() / delta_cluster[pos].abs().sum().clamp_min(1e-8)) if bool(pos.any()) else 1.0
-        neg_ret = float(final[neg].abs().sum() / delta_cluster[neg].abs().sum().clamp_min(1e-8)) if bool(neg.any()) else 1.0
-        self.last_hg_part4_analysis = {
-            "enabled": True, "mode": "original_symmetric_hg_gate", "num_clusters": int(k_t), "num_valid_hyperedges": int(valid.sum()),
-            "edge_degree_sf": float(degrees[0]), "edge_degree_cand": float(degrees[1]), "edge_degree_seed": float(degrees[2]),
-            "cluster_sf_mean": float(cluster_sf.mean()), "cluster_cand_mean": float(cluster_cand.mean()), "cluster_seed_mean": float(cluster_seed.mean()), "cluster_sbn_mean": float(cluster_sb.mean()),
-            "direct_support_mean": float(direct.mean()), "group_support_mean": float(group.mean()),
-            "raw_reliability_mean": float(raw_reliability.mean()), "raw_reliability_std": float(raw_reliability.std(unbiased=False)), "raw_reliability_min": float(raw_reliability.min()), "raw_reliability_max": float(raw_reliability.max()), "gate_formula_error_abs_max": formula_error, "empty_hypergraph_fallback": not bool(valid.any()),
-            "hg_gate_mean": float(gate.mean()), "hg_gate_std": float(gate.std(unbiased=False)), "hg_gate_min": float(gate.min()), "hg_gate_max": float(gate.max()),
-            "delta_base_abs_mean": float(delta_cluster.abs().mean()), "delta_final_abs_mean": float(final.abs().mean()), "delta_change_abs_mean": float((final-delta_cluster).abs().mean()),
-            "positive_delta_clusters": int(pos.sum()), "negative_delta_clusters": int(neg.sum()),
-            "positive_delta_abs_before": mean_if(delta_cluster,pos), "positive_delta_abs_after": mean_if(final,pos), "negative_delta_abs_before": mean_if(delta_cluster,neg), "negative_delta_abs_after": mean_if(final,neg),
-            "correction_retention_ratio": 1.0 if float(base_sum) <= 1e-8 else float(final.abs().sum()/base_sum),
-            "sign_flip_count": int(((torch.sign(delta_cluster)!=torch.sign(final)) & (delta_cluster!=0) & (final!=0)).sum()),
-            "multi_evidence_cluster_fraction": float(((H>0).sum(1)>=2).float().mean()),
-            "positive_retention_ratio": pos_ret, "negative_retention_ratio": neg_ret,
-            "positive_delta_change_abs_mean": float((final[pos]-delta_cluster[pos]).abs().mean()) if bool(pos.any()) else 0.0,
-            "negative_delta_change_abs_mean": float((final[neg]-delta_cluster[neg]).abs().mean()) if bool(neg.any()) else 0.0,
-            "num_positive_gated_clusters": int(pos.sum()), "num_negative_gated_clusters": int(neg.sum()),
-        }
-        return final[labels_t].view(h_t, w_t)
+
+        return delta_cluster[labels_t].view(h_t, w_t)
 
     def _part4_semantic_consistency_correction(
         self,
@@ -1056,6 +829,6 @@ class FoRIS(nn.Module):
         penalty = self._semantic_disagreement_penalty(sf, sbn, cand_soft, seed_prior)
         score = score - penalty
         score = score 
-        delta_map = self._semantic_cluster_reweight_map(tgt_feat, sf, sbn, cand_soft, seed_prior)
+        delta_map = self._semantic_cluster_reweight_map(tgt_feat, sf, sbn)
         return score + delta_map
 

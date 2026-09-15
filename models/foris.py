@@ -42,6 +42,8 @@ class FoRIS(nn.Module):
         semantic_penalty_uncertainty_power: float = 1.5,
         semantic_penalty_max: float = 0.22,
         semantic_cluster_neg_cap: float = 0.12,
+        reference_counterfactual_view: bool = False,
+        reference_counterfactual_blend: float = 0.5,
     ):
         super().__init__()
         if device.startswith("cuda") and not torch.cuda.is_available():
@@ -83,6 +85,10 @@ class FoRIS(nn.Module):
         self.semantic_penalty_uncertainty_power = float(semantic_penalty_uncertainty_power)
         self.semantic_penalty_max = float(semantic_penalty_max)
         self.semantic_cluster_neg_cap = float(semantic_cluster_neg_cap)
+        self.reference_counterfactual_view = bool(reference_counterfactual_view)
+        self.reference_counterfactual_blend = float(reference_counterfactual_blend)
+        if not 0.0 <= self.reference_counterfactual_blend <= 1.0:
+            raise ValueError("reference_counterfactual_blend must be in [0, 1]")
 
 
         if mask_refiner == "crf":
@@ -97,6 +103,7 @@ class FoRIS(nn.Module):
         self._orig_tgt_size = None
 
         self.should_debiass = True
+        self.last_reference_counterfactual_analysis = None
 
     # ──────────────────────── Public API ────────────────────────
 
@@ -182,10 +189,20 @@ class FoRIS(nn.Module):
         fmaps = self._extract_features(imgs)
         fmaps_norm = F.normalize(fmaps, p=2, dim=2)
         _, _, _, h, w = fmaps_norm.shape
+        ref_masks_full = ref_masks
         ref_masks = ref_masks.unsqueeze(1)
 
         # Part 1 — positional debiasing
         fmaps_norm = self._part1_positional_debias(fmaps_norm, ref_masks, S)
+        ref_feats_fg_view = None
+        if self.reference_counterfactual_view:
+            counterfactual_images = self._build_reference_counterfactual_images(
+                ref_images, ref_masks_full,
+            )
+            counterfactual_fmaps = self._extract_features(counterfactual_images.unsqueeze(0))
+            ref_feats_fg_view = F.normalize(counterfactual_fmaps, p=2, dim=2)
+            if self.should_debiass:
+                ref_feats_fg_view = self._debias_features(ref_feats_fg_view)
 
         # Part 2 — two-stage background suppression (stage1 gate + stage2 fg/bg score)
         part2 = self._part2_background_suppression(
@@ -194,6 +211,7 @@ class FoRIS(nn.Module):
             n_refs=S,
             h=h,
             w=w,
+            ref_feats_fg_view=ref_feats_fg_view,
         )
         if part2 is None:
             raise RuntimeError("No foreground tokens in reference mask(s).")
@@ -235,6 +253,22 @@ class FoRIS(nn.Module):
         x = einops.rearrange(imgs, "b t c h w -> (b t) c h w")
         fmaps = self.encoder.get_intermediate_layers(x, n=1, reshape=True)[0]
         return einops.rearrange(fmaps, "(b t) c h w -> b t c h w", b=B)
+
+    @staticmethod
+    def _build_reference_counterfactual_images(
+        ref_images: torch.Tensor,
+        ref_masks: torch.Tensor,
+    ) -> torch.Tensor:
+        """Replace reference background with its per-image channel mean."""
+        mask = ref_masks.unsqueeze(1).to(dtype=ref_images.dtype)
+        background = 1.0 - mask
+        background_count = background.sum(dim=(-2, -1), keepdim=True)
+        background_mean = (ref_images * background).sum(
+            dim=(-2, -1), keepdim=True,
+        ) / background_count.clamp_min(1.0)
+        image_mean = ref_images.mean(dim=(-2, -1), keepdim=True)
+        fill = torch.where(background_count > 0, background_mean, image_mean)
+        return ref_images * mask + fill * background
 
     def _binarize_response(
         self,
@@ -467,6 +501,7 @@ class FoRIS(nn.Module):
         h: int,
         w: int,
         tgt_feat_raw: torch.Tensor,
+        ref_feats_fg_view: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
         """Part 2 stage 2: fg prototype matching with hard-negative bg suppression."""
         w_bg = float(self.dino_bg_weight)
@@ -495,6 +530,67 @@ class FoRIS(nn.Module):
         if stats is None:
             return None
         mu_fg, mu_bg, fg_protos = stats
+        mu_fg_original = mu_fg
+        if ref_feats_fg_view is not None:
+            original_fg: list[torch.Tensor] = []
+            counterfactual_fg: list[torch.Tensor] = []
+            counterfactual_ref_means: list[torch.Tensor] = []
+            for shot in range(n_refs):
+                membership = ref_masks_ds[shot]
+                original_tokens = ref_feats[0, shot][:, membership]
+                counterfactual_tokens = ref_feats_fg_view[0, shot][:, membership]
+                if original_tokens.shape[1] > 0:
+                    original_fg.append(original_tokens)
+                    counterfactual_fg.append(counterfactual_tokens)
+                    counterfactual_ref_means.append(counterfactual_tokens.mean(dim=1))
+            if original_fg:
+                blend = self.reference_counterfactual_blend
+                mu_fg_view = F.normalize(
+                    torch.stack(counterfactual_ref_means).mean(dim=0), p=2, dim=0,
+                )
+                mu_fg = F.normalize(
+                    (1.0 - blend) * mu_fg_original + blend * mu_fg_view,
+                    p=2, dim=0,
+                )
+                original_matrix = F.normalize(
+                    torch.cat(original_fg, dim=1).transpose(0, 1), p=2, dim=1,
+                )
+                counterfactual_matrix = F.normalize(
+                    torch.cat(counterfactual_fg, dim=1).transpose(0, 1), p=2, dim=1,
+                )
+                labels = agglomerative_clustering(original_matrix, tau=self.tau)
+                num_prototypes = int(labels.max().item()) + 1
+                original_prototypes = compute_cluster_prototypes(
+                    original_matrix, labels, K=num_prototypes,
+                )
+                view_prototypes = compute_cluster_prototypes(
+                    counterfactual_matrix, labels, K=num_prototypes,
+                )
+                fg_protos = F.normalize(
+                    (1.0 - blend) * original_prototypes + blend * view_prototypes,
+                    p=2, dim=1,
+                )
+                self.last_reference_counterfactual_analysis = {
+                    "enabled": True,
+                    "blend": blend,
+                    "num_fg_tokens": int(original_matrix.shape[0]),
+                    "num_fg_prototypes": num_prototypes,
+                    "mu_original_view_cosine": float(torch.dot(mu_fg_original, mu_fg_view)),
+                    "prototype_original_view_cosine_mean": float(
+                        (original_prototypes * view_prototypes).sum(dim=1).mean()
+                    ),
+                    "mu_original_fused_cosine": float(torch.dot(mu_fg_original, mu_fg)),
+                    "fallback": False,
+                }
+            else:
+                self.last_reference_counterfactual_analysis = {
+                    "enabled": True, "blend": self.reference_counterfactual_blend,
+                    "num_fg_tokens": 0, "num_fg_prototypes": 0, "fallback": True,
+                }
+        else:
+            self.last_reference_counterfactual_analysis = {
+                "enabled": False, "blend": 0.0, "fallback": False,
+            }
 
         # Hard-negative mean is often correlated with mu_fg; orthogonalize so sim_bg
         # measures similarity along directions not explained by the foreground prototype.
@@ -527,6 +623,7 @@ class FoRIS(nn.Module):
         n_refs: int,
         h: int,
         w: int,
+        ref_feats_fg_view: torch.Tensor | None = None,
     ) -> (
         tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
         | None
@@ -547,6 +644,7 @@ class FoRIS(nn.Module):
             h=h,
             w=w,
             tgt_feat_raw=tgt_feat_raw,
+            ref_feats_fg_view=ref_feats_fg_view,
         )
         if stage2 is None:
             return None

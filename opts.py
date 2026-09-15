@@ -57,6 +57,17 @@ def get_args_parser() -> argparse.ArgumentParser:
         type=float,
         help="Cluster aggregation threshold",
     )
+    parser.add_argument(
+        "--reference-counterfactual-view",
+        action="store_true",
+        help="Fuse Stage2 FG prototypes with a background-suppressed reference view.",
+    )
+    parser.add_argument(
+        "--reference-counterfactual-blend",
+        default=0.5,
+        type=float,
+        help="Counterfactual contribution to Stage2 FG prototypes.",
+    )
 
     # Dataset
     parser.add_argument(

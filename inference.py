@@ -2,6 +2,7 @@
 
 import argparse
 import datetime
+import json
 import os
 import random
 import sys
@@ -56,6 +57,7 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
     loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=args.num_workers,
                         collate_fn=lambda x: x[0])
     meter = AverageMeter(args.dataset, ds.class_ids)
+    counterfactual_records = []
 
     # ──────── Evaluation loop ────────
     pbar = tqdm(loader, ncols=80)
@@ -100,6 +102,14 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
 
         fg_union = area_union[1].clamp_min(1.0)
         episode_iou = (area_inter[1] / fg_union * 100.0).item()
+        analysis = getattr(model, "last_reference_counterfactual_analysis", None)
+        if analysis is not None:
+            counterfactual_records.append({
+                "episode_index": int(idx),
+                "class_id": int(torch.as_tensor(batch["class_id"]).reshape(-1)[0]),
+                "episode_iou": float(episode_iou),
+                **analysis,
+            })
         # save_episode_visualizations(
         #     reference_image=ref_imgs[0],
         #     reference_mask=ref_masks[0],
@@ -122,6 +132,25 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
     print(out_str)
     with open(log_file, 'a') as fp:
         fp.write(out_str + '\n')
+    numeric_keys = (
+        "num_fg_tokens", "num_fg_prototypes", "mu_original_view_cosine",
+        "prototype_original_view_cosine_mean", "mu_original_fused_cosine",
+    )
+    summary = {
+        "mode": "reference_foreground_counterfactual_view",
+        "enabled": bool(args.reference_counterfactual_view),
+        "blend": float(args.reference_counterfactual_blend),
+        "miou": float(miou),
+        "num_episodes": len(counterfactual_records),
+        "fallback_count": int(sum(record.get("fallback", False) for record in counterfactual_records)),
+    }
+    for key in numeric_keys:
+        values = [record[key] for record in counterfactual_records if key in record]
+        summary[f"{key}_mean"] = float(np.mean(values)) if values else None
+    analysis_path = join(args.output_dir, "reference_counterfactual_analysis.json")
+    with open(analysis_path, "w", encoding="utf-8") as fp:
+        json.dump({"summary": summary, "episodes": counterfactual_records}, fp, indent=2, ensure_ascii=False)
+    print(f"Reference counterfactual analysis saved to: {analysis_path}")
     return miou
 
 

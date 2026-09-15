@@ -42,6 +42,8 @@ class FoRIS(nn.Module):
         semantic_penalty_uncertainty_power: float = 1.5,
         semantic_penalty_max: float = 0.22,
         semantic_cluster_neg_cap: float = 0.12,
+        candidate_similarity: str = "csls",
+        csls_k: int = 10,
     ):
         super().__init__()
         if device.startswith("cuda") and not torch.cuda.is_available():
@@ -83,6 +85,10 @@ class FoRIS(nn.Module):
         self.semantic_penalty_uncertainty_power = float(semantic_penalty_uncertainty_power)
         self.semantic_penalty_max = float(semantic_penalty_max)
         self.semantic_cluster_neg_cap = float(semantic_cluster_neg_cap)
+        if candidate_similarity not in {"cosine", "csls"}:
+            raise ValueError(f"Unknown candidate similarity: {candidate_similarity}")
+        self.candidate_similarity = candidate_similarity
+        self.csls_k = max(1, int(csls_k))
 
 
         if mask_refiner == "crf":
@@ -97,6 +103,7 @@ class FoRIS(nn.Module):
         self._orig_tgt_size = None
 
         self.should_debiass = True
+        self.last_candidate_matching_analysis = None
 
     # ──────────────────────── Public API ────────────────────────
 
@@ -579,22 +586,73 @@ class FoRIS(nn.Module):
         tgt_norm = F.normalize(tgt_feat, p=2, dim=1)
 
         votes = torch.zeros((h, w), dtype=torch.int32, device=device)
+        cosine_votes = torch.zeros_like(votes)
+        per_reference_analysis: list[dict[str, float | int]] = []
         for m in range(n_refs):
             # [1, C, H, W]: match target's per-patch channel normalization.
             ref_m = F.normalize(ref_feats[0:1, m], p=2, dim=1)
             sim_m = torch.einsum("bchw,bcxy->bhwxy", ref_m, tgt_norm)
             sim0 = sim_m[0]
             Hs, Ws = sim0.shape[:2]
-            sim_t_to_r = sim0.permute(2, 3, 0, 1)
-            best_idx = sim_t_to_r.reshape(h, w, -1).argmax(dim=2)
+            affinity = sim0.permute(2, 3, 0, 1).reshape(h * w, Hs * Ws)
+            cosine_best_idx = affinity.argmax(dim=1)
+            k_ref = min(self.csls_k, affinity.shape[1])
+            k_query = min(self.csls_k, affinity.shape[0])
+            rho_query = torch.topk(affinity, k=k_ref, dim=1).values.mean(dim=1)
+            rho_reference = torch.topk(affinity, k=k_query, dim=0).values.mean(dim=0)
+            csls_affinity = affinity - 0.5 * rho_query[:, None] - 0.5 * rho_reference[None, :]
+            csls_best_idx = csls_affinity.argmax(dim=1)
+            best_idx = csls_best_idx if self.candidate_similarity == "csls" else cosine_best_idx
+            best_idx = best_idx.view(h, w)
             rows = best_idx // Ws
             cols = best_idx % Ws
             ref_mask_m = downsample_mask(ref_masks[m : m + 1], Hs, Ws).squeeze(0)
             votes += ref_mask_m[rows, cols].to(torch.int32)
 
+            cosine_rows = cosine_best_idx.view(h, w) // Ws
+            cosine_cols = cosine_best_idx.view(h, w) % Ws
+            cosine_votes += ref_mask_m[cosine_rows, cosine_cols].to(torch.int32)
+            active_hist = torch.bincount(best_idx.reshape(-1), minlength=Hs * Ws).float()
+            cosine_hist = torch.bincount(cosine_best_idx, minlength=Hs * Ws).float()
+            active_freq = active_hist / active_hist.sum().clamp_min(1.0)
+            cosine_freq = cosine_hist / cosine_hist.sum().clamp_min(1.0)
+            per_reference_analysis.append({
+                "selection_change_fraction": float((csls_best_idx != cosine_best_idx).float().mean()),
+                "active_max_reference_frequency": float(active_freq.max()),
+                "cosine_max_reference_frequency": float(cosine_freq.max()),
+                "active_reference_hhi": float(active_freq.square().sum()),
+                "cosine_reference_hhi": float(cosine_freq.square().sum()),
+                "active_fg_hit_fraction": float(ref_mask_m[rows, cols].float().mean()),
+                "cosine_fg_hit_fraction": float(ref_mask_m[cosine_rows, cosine_cols].float().mean()),
+                "rho_query_mean": float(rho_query.mean()),
+                "rho_reference_mean": float(rho_reference.mean()),
+            })
+
         candidates_mask = votes >= math.ceil(n_refs / 2)
+        cosine_candidates = cosine_votes >= math.ceil(n_refs / 2)
 
         vote_soft = votes.to(dtype=dtype) / float(max(1, n_refs))
+
+        def average(key: str) -> float:
+            return sum(float(item[key]) for item in per_reference_analysis) / max(1, len(per_reference_analysis))
+
+        self.last_candidate_matching_analysis = {
+            "mode": self.candidate_similarity,
+            "csls_k": self.csls_k,
+            "num_references": n_refs,
+            "selection_change_fraction": average("selection_change_fraction"),
+            "candidate_change_fraction": float((candidates_mask != cosine_candidates).float().mean()),
+            "active_candidate_fraction": float(candidates_mask.float().mean()),
+            "cosine_candidate_fraction": float(cosine_candidates.float().mean()),
+            "active_max_reference_frequency": average("active_max_reference_frequency"),
+            "cosine_max_reference_frequency": average("cosine_max_reference_frequency"),
+            "active_reference_hhi": average("active_reference_hhi"),
+            "cosine_reference_hhi": average("cosine_reference_hhi"),
+            "active_fg_hit_fraction": average("active_fg_hit_fraction"),
+            "cosine_fg_hit_fraction": average("cosine_fg_hit_fraction"),
+            "rho_query_mean": average("rho_query_mean"),
+            "rho_reference_mean": average("rho_reference_mean"),
+        }
 
         return candidates_mask,  vote_soft
 

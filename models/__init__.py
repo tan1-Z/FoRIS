@@ -71,6 +71,8 @@ def build_foris(
     mask_refiner: str = "bilinear",
     resize_to_orig_size: bool = True,
     device: str = "cuda",
+    candidate_similarity: str = "csls",
+    csls_k: int = 10,
 ):
     encoder = _build_encoder(model_size)
     model = FoRIS(
@@ -81,6 +83,8 @@ def build_foris(
         mask_refiner=mask_refiner,
         resize_to_orig_size=resize_to_orig_size,
         device=device,
+        candidate_similarity=candidate_similarity,
+        csls_k=csls_k,
     )
     for param in model.parameters():
         param.requires_grad = False
@@ -96,4 +100,6 @@ def build_foris_from_args(args):
         mask_refiner='crf' if getattr(args, 'crf_mask_refinement', False) else 'bilinear',
         resize_to_orig_size=False,
         device=args.device,
+        candidate_similarity=args.candidate_similarity,
+        csls_k=args.csls_k,
     )

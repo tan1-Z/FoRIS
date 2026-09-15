@@ -2,6 +2,7 @@
 
 import argparse
 import datetime
+import json
 import os
 import random
 import sys
@@ -56,6 +57,7 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
     loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=args.num_workers,
                         collate_fn=lambda x: x[0])
     meter = AverageMeter(args.dataset, ds.class_ids)
+    matching_records = []
 
     # ──────── Evaluation loop ────────
     pbar = tqdm(loader, ncols=80)
@@ -100,6 +102,14 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
 
         fg_union = area_union[1].clamp_min(1.0)
         episode_iou = (area_inter[1] / fg_union * 100.0).item()
+        matching = getattr(model, "last_candidate_matching_analysis", None)
+        if matching is not None:
+            matching_records.append({
+                "episode_index": int(idx),
+                "class_id": int(torch.as_tensor(batch["class_id"]).reshape(-1)[0]),
+                "episode_iou": float(episode_iou),
+                **matching,
+            })
         # save_episode_visualizations(
         #     reference_image=ref_imgs[0],
         #     reference_mask=ref_masks[0],
@@ -122,6 +132,29 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
     print(out_str)
     with open(log_file, 'a') as fp:
         fp.write(out_str + '\n')
+    diagnostic_keys = (
+        "selection_change_fraction", "candidate_change_fraction",
+        "active_candidate_fraction", "cosine_candidate_fraction",
+        "active_max_reference_frequency", "cosine_max_reference_frequency",
+        "active_reference_hhi", "cosine_reference_hhi",
+        "active_fg_hit_fraction", "cosine_fg_hit_fraction",
+        "rho_query_mean", "rho_reference_mean",
+    )
+    summary = {
+        "mode": args.candidate_similarity,
+        "csls_k": int(args.csls_k),
+        "miou": float(miou),
+        "num_episodes": len(matching_records),
+        **{
+            f"{key}_mean": float(np.mean([record[key] for record in matching_records]))
+            if matching_records else None
+            for key in diagnostic_keys
+        },
+    }
+    analysis_path = join(args.output_dir, "candidate_matching_analysis.json")
+    with open(analysis_path, "w", encoding="utf-8") as fp:
+        json.dump({"summary": summary, "episodes": matching_records}, fp, indent=2, ensure_ascii=False)
+    print(f"Candidate matching analysis saved to: {analysis_path}")
     return miou
 
 

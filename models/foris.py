@@ -745,7 +745,9 @@ class FoRIS(nn.Module):
         yy, xx = yy.unsqueeze(-1), xx.unsqueeze(-1)
         mutual_radius = 1
         for m in range(n_refs):
-            ref_m = F.normalize(ref_feats[0:1, m], p=2, dim=2)
+            # [1, C, H, W]: normalize each reference patch over feature channels,
+            # matching target normalization and making the affinity a cosine score.
+            ref_m = F.normalize(ref_feats[0:1, m], p=2, dim=1)
             sim_m = torch.einsum("bchw,bcxy->bhwxy", ref_m, tgt_norm)
             sim0 = sim_m[0]
             Hs, Ws = sim0.shape[:2]

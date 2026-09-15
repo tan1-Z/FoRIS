@@ -57,18 +57,6 @@ def get_args_parser() -> argparse.ArgumentParser:
         type=float,
         help="Cluster aggregation threshold",
     )
-    parser.add_argument(
-        "--candidate-similarity",
-        default="csls",
-        choices=["cosine", "csls"],
-        help="Affinity used by cross-image candidate matching.",
-    )
-    parser.add_argument(
-        "--csls-k",
-        default=10,
-        type=int,
-        help="Neighborhood size for half-scaled CSLS density correction.",
-    )
 
     # Dataset
     parser.add_argument(

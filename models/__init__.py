@@ -14,22 +14,16 @@ _HUB_NAMES = {
 _WEIGHTS = {
     "small": "/home/user9/dataset/user9/DINOV3/dinov3_vits16_pretrain_lvd1689m-08c60483.pth",
     "base": "/home/user9/dataset/user9/DINOV3/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth",
-    "large": "/home/user9/dataset/user9/DINOV3/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth",
+    "large": "/home/lilinfei/FoRIS/pretrain/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth",
 }
 
 
 def _build_encoder(model_size: str = "large"):
-    # return torch.hub.load(
-    #     "/home/user9/dataset/user9/DINOV3/dinov3",
-    #     _HUB_NAMES[model_size],
-    #     weights=_WEIGHTS[model_size],
-    # )
     return torch.hub.load(
-    "/home/user9/dataset/user9/DINOV3/dinov3",
-    _HUB_NAMES[model_size],
-    source="local",
-    weights=_WEIGHTS[model_size],
-)
+        "facebookresearch/dinov3",
+        _HUB_NAMES[model_size],
+        weights=_WEIGHTS[model_size],
+    )
 
 
 

@@ -134,6 +134,9 @@ def _build_hyperedges_fast(
     *,
     similarity_threshold: float,
     anchor_ratio: float,
+    fg_anchor_margin: float,
+    bg_anchor_margin: float,
+    min_fg_view_reliability: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, int]]:
     """Vectorized construction of local and anchored hyperedges on GPU."""
     channels, height, width = target_features.shape
@@ -180,34 +183,64 @@ def _build_hyperedges_fast(
     flat_view = view_reliability.reshape(-1)
     anchors = max(1, int(round(num_nodes * anchor_ratio)))
 
-    def make_anchors(confidence: torch.Tensor, anchor_value: float, reliability: torch.Tensor):
-        confidence_at_centers = confidence[local_centers]
-        count = min(anchors, confidence_at_centers.numel())
-        chosen = confidence_at_centers.topk(count).indices
+    def make_anchors(
+        margin: torch.Tensor,
+        anchor_value: float,
+        reliability: torch.Tensor,
+        minimum_margin: float,
+        minimum_reliability: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        margin_at_centers = margin[local_centers]
+        reliability_at_centers = reliability[local_centers]
+        eligible = (
+            (margin_at_centers >= minimum_margin)
+            & (reliability_at_centers >= minimum_reliability)
+        )
+        eligible_count = int(eligible.sum().item())
+        if eligible_count == 0:
+            empty_nodes = torch.empty((0, 6), device=target_features.device, dtype=torch.long)
+            empty_fixed = torch.empty((0, 6), device=target_features.device, dtype=target_features.dtype)
+            empty_weight = torch.empty((0,), device=target_features.device, dtype=target_features.dtype)
+            return empty_nodes, empty_fixed, empty_weight, eligible_count
+        count = min(anchors, eligible_count)
+        ranked_margin = margin_at_centers.masked_fill(~eligible, float("-inf"))
+        chosen = ranked_margin.topk(count).indices
         nodes = torch.cat([
             local_nodes[chosen],
             torch.full((count, 1), -1, dtype=torch.long, device=target_features.device),
         ], dim=1)
         fixed = torch.zeros((count, 6), device=target_features.device, dtype=target_features.dtype)
         fixed[:, -1] = anchor_value
+        normalized_margin = (
+            (margin_at_centers[chosen] - minimum_margin)
+            / max(1e-6, 1.0 - minimum_margin)
+        ).clamp(0.0, 1.0)
         weight = (
             local_weight[chosen]
-            * confidence_at_centers[chosen].clamp_min(0.0)
-            * reliability[local_centers[chosen]].clamp_min(0.0)
+            * normalized_margin
+            * reliability_at_centers[chosen].clamp_min(0.0)
         )
         keep_anchor = weight > 0
-        return nodes[keep_anchor], fixed[keep_anchor], weight[keep_anchor]
+        return nodes[keep_anchor], fixed[keep_anchor], weight[keep_anchor], eligible_count
 
     local_nodes_padded = torch.cat([
         local_nodes,
         torch.full((local_nodes.shape[0], 1), -2, dtype=torch.long, device=target_features.device),
     ], dim=1)
     local_fixed = torch.zeros_like(local_nodes_padded, dtype=target_features.dtype)
-    fg_nodes, fg_fixed, fg_weight = make_anchors(
-        (flat_sf * (1.0 - flat_sbn)).clamp(0.0, 1.0), 1.0, flat_view
+    fg_nodes, fg_fixed, fg_weight, fg_candidate_count = make_anchors(
+        (flat_sf - flat_sbn).clamp(-1.0, 1.0),
+        1.0,
+        flat_view,
+        fg_anchor_margin,
+        min_fg_view_reliability,
     )
-    bg_nodes, bg_fixed, bg_weight = make_anchors(
-        (flat_sbn * (1.0 - flat_sf)).clamp(0.0, 1.0), 0.0, torch.ones_like(flat_view)
+    bg_nodes, bg_fixed, bg_weight, bg_candidate_count = make_anchors(
+        (flat_sbn - flat_sf).clamp(-1.0, 1.0),
+        0.0,
+        torch.ones_like(flat_view),
+        bg_anchor_margin,
+        0.0,
     )
     edge_nodes = torch.cat([local_nodes_padded, fg_nodes, bg_nodes], dim=0)
     fixed_values = torch.cat([local_fixed, fg_fixed, bg_fixed], dim=0)
@@ -225,6 +258,8 @@ def _build_hyperedges_fast(
         "num_local_hyperedges": int(local_nodes.shape[0]),
         "num_fg_anchor_hyperedges": int(fg_nodes.shape[0]),
         "num_bg_anchor_hyperedges": int(bg_nodes.shape[0]),
+        "num_fg_anchor_candidates": fg_candidate_count,
+        "num_bg_anchor_candidates": bg_candidate_count,
     }
     return edge_nodes, fixed_values, weights, degree, counts
 
@@ -241,6 +276,9 @@ def hypergraph_tv_refine(
     iterations: int,
     local_similarity_threshold: float,
     anchor_ratio: float,
+    fg_anchor_margin: float,
+    bg_anchor_margin: float,
+    min_fg_view_reliability: float,
     primal_step: float,
     dual_step: float,
     tolerance: float,
@@ -253,7 +291,14 @@ def hypergraph_tv_refine(
     """
     if score.ndim != 2 or target_features.ndim != 3:
         raise ValueError("Expected score [H,W] and target_features [C,H,W]")
-    if lam < 0 or iterations < 1 or not 0 < anchor_ratio <= 1:
+    if (
+        lam < 0
+        or iterations < 1
+        or not 0 < anchor_ratio <= 1
+        or not -1.0 <= fg_anchor_margin <= 1.0
+        or not -1.0 <= bg_anchor_margin <= 1.0
+        or not 0.0 <= min_fg_view_reliability <= 1.0
+    ):
         raise ValueError("Invalid hypergraph TV configuration")
 
     height, width = score.shape
@@ -281,6 +326,9 @@ def hypergraph_tv_refine(
             view_reliability,
             similarity_threshold=local_similarity_threshold,
             anchor_ratio=anchor_ratio,
+            fg_anchor_margin=fg_anchor_margin,
+            bg_anchor_margin=bg_anchor_margin,
+            min_fg_view_reliability=min_fg_view_reliability,
         )
     except RuntimeError as error:
         return s0, {

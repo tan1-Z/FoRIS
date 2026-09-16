@@ -180,6 +180,7 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
     tv_numeric_keys = (
         "num_hyperedges", "num_local_hyperedges",
         "num_fg_anchor_hyperedges", "num_bg_anchor_hyperedges",
+        "num_fg_anchor_candidates", "num_bg_anchor_candidates",
         "mean_hyperedge_weight", "mean_node_degree", "max_node_degree",
         "iterations", "primal_residual", "dual_residual",
         "mean_absolute_score_change",
@@ -193,6 +194,9 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
         "max_iterations": int(args.hypergraph_tv_iterations),
         "local_similarity": float(args.hypergraph_tv_local_similarity),
         "anchor_ratio": float(args.hypergraph_tv_anchor_ratio),
+        "fg_anchor_margin": float(args.hypergraph_tv_fg_anchor_margin),
+        "bg_anchor_margin": float(args.hypergraph_tv_bg_anchor_margin),
+        "min_fg_view_reliability": float(args.hypergraph_tv_min_fg_view_reliability),
         "primal_step": float(args.hypergraph_tv_primal_step),
         "dual_step": float(args.hypergraph_tv_dual_step),
         "tolerance": float(args.hypergraph_tv_tolerance),

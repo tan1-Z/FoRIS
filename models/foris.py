@@ -50,6 +50,9 @@ class FoRIS(nn.Module):
         hypergraph_tv_iterations: int = 50,
         hypergraph_tv_local_similarity: float = 0.5,
         hypergraph_tv_anchor_ratio: float = 0.1,
+        hypergraph_tv_fg_anchor_margin: float = 0.2,
+        hypergraph_tv_bg_anchor_margin: float = 0.2,
+        hypergraph_tv_min_fg_view_reliability: float = 0.7,
         hypergraph_tv_primal_step: float = 0.02,
         hypergraph_tv_dual_step: float = 0.02,
         hypergraph_tv_tolerance: float = 1e-4,
@@ -106,6 +109,12 @@ class FoRIS(nn.Module):
             raise ValueError("hypergraph_tv_local_similarity must be in [0, 1]")
         if not 0.0 < hypergraph_tv_anchor_ratio <= 1.0:
             raise ValueError("hypergraph_tv_anchor_ratio must be in (0, 1]")
+        if not -1.0 <= hypergraph_tv_fg_anchor_margin <= 1.0:
+            raise ValueError("hypergraph_tv_fg_anchor_margin must be in [-1, 1]")
+        if not -1.0 <= hypergraph_tv_bg_anchor_margin <= 1.0:
+            raise ValueError("hypergraph_tv_bg_anchor_margin must be in [-1, 1]")
+        if not 0.0 <= hypergraph_tv_min_fg_view_reliability <= 1.0:
+            raise ValueError("hypergraph_tv_min_fg_view_reliability must be in [0, 1]")
         if hypergraph_tv_primal_step <= 0 or hypergraph_tv_dual_step <= 0:
             raise ValueError("Hypergraph TV primal and dual steps must be positive")
         if hypergraph_tv_tolerance < 0:
@@ -115,6 +124,11 @@ class FoRIS(nn.Module):
         self.hypergraph_tv_iterations = int(hypergraph_tv_iterations)
         self.hypergraph_tv_local_similarity = float(hypergraph_tv_local_similarity)
         self.hypergraph_tv_anchor_ratio = float(hypergraph_tv_anchor_ratio)
+        self.hypergraph_tv_fg_anchor_margin = float(hypergraph_tv_fg_anchor_margin)
+        self.hypergraph_tv_bg_anchor_margin = float(hypergraph_tv_bg_anchor_margin)
+        self.hypergraph_tv_min_fg_view_reliability = float(
+            hypergraph_tv_min_fg_view_reliability
+        )
         self.hypergraph_tv_primal_step = float(hypergraph_tv_primal_step)
         self.hypergraph_tv_dual_step = float(hypergraph_tv_dual_step)
         self.hypergraph_tv_tolerance = float(hypergraph_tv_tolerance)
@@ -291,6 +305,9 @@ class FoRIS(nn.Module):
                 iterations=self.hypergraph_tv_iterations,
                 local_similarity_threshold=self.hypergraph_tv_local_similarity,
                 anchor_ratio=self.hypergraph_tv_anchor_ratio,
+                fg_anchor_margin=self.hypergraph_tv_fg_anchor_margin,
+                bg_anchor_margin=self.hypergraph_tv_bg_anchor_margin,
+                min_fg_view_reliability=self.hypergraph_tv_min_fg_view_reliability,
                 primal_step=self.hypergraph_tv_primal_step,
                 dual_step=self.hypergraph_tv_dual_step,
                 tolerance=self.hypergraph_tv_tolerance,

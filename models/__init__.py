@@ -67,6 +67,14 @@ def build_foris(
     device: str = "cuda",
     reference_counterfactual_view: bool = False,
     reference_counterfactual_blend: float = 0.5,
+    hypergraph_tv: bool = False,
+    hypergraph_tv_lambda: float = 0.05,
+    hypergraph_tv_iterations: int = 50,
+    hypergraph_tv_local_similarity: float = 0.5,
+    hypergraph_tv_anchor_ratio: float = 0.1,
+    hypergraph_tv_primal_step: float = 0.02,
+    hypergraph_tv_dual_step: float = 0.02,
+    hypergraph_tv_tolerance: float = 1e-4,
 ):
     encoder = _build_encoder(model_size)
     model = FoRIS(
@@ -79,6 +87,14 @@ def build_foris(
         device=device,
         reference_counterfactual_view=reference_counterfactual_view,
         reference_counterfactual_blend=reference_counterfactual_blend,
+        hypergraph_tv=hypergraph_tv,
+        hypergraph_tv_lambda=hypergraph_tv_lambda,
+        hypergraph_tv_iterations=hypergraph_tv_iterations,
+        hypergraph_tv_local_similarity=hypergraph_tv_local_similarity,
+        hypergraph_tv_anchor_ratio=hypergraph_tv_anchor_ratio,
+        hypergraph_tv_primal_step=hypergraph_tv_primal_step,
+        hypergraph_tv_dual_step=hypergraph_tv_dual_step,
+        hypergraph_tv_tolerance=hypergraph_tv_tolerance,
     )
     for param in model.parameters():
         param.requires_grad = False
@@ -96,4 +112,12 @@ def build_foris_from_args(args):
         device=args.device,
         reference_counterfactual_view=args.reference_counterfactual_view,
         reference_counterfactual_blend=args.reference_counterfactual_blend,
+        hypergraph_tv=args.hypergraph_tv,
+        hypergraph_tv_lambda=args.hypergraph_tv_lambda,
+        hypergraph_tv_iterations=args.hypergraph_tv_iterations,
+        hypergraph_tv_local_similarity=args.hypergraph_tv_local_similarity,
+        hypergraph_tv_anchor_ratio=args.hypergraph_tv_anchor_ratio,
+        hypergraph_tv_primal_step=args.hypergraph_tv_primal_step,
+        hypergraph_tv_dual_step=args.hypergraph_tv_dual_step,
+        hypergraph_tv_tolerance=args.hypergraph_tv_tolerance,
     )

@@ -14,6 +14,7 @@ from PIL import Image
 
 from utils.clustering import agglomerative_clustering, compute_cluster_prototypes
 from utils.data import build_transform, denormalize, downsample_mask
+from utils.hypergraph_tv import hypergraph_tv_refine
 from utils.refinement import crf_refine, init_crf, upsample_mask
 
 
@@ -44,6 +45,14 @@ class FoRIS(nn.Module):
         semantic_cluster_neg_cap: float = 0.12,
         reference_counterfactual_view: bool = False,
         reference_counterfactual_blend: float = 0.5,
+        hypergraph_tv: bool = False,
+        hypergraph_tv_lambda: float = 0.05,
+        hypergraph_tv_iterations: int = 50,
+        hypergraph_tv_local_similarity: float = 0.5,
+        hypergraph_tv_anchor_ratio: float = 0.1,
+        hypergraph_tv_primal_step: float = 0.02,
+        hypergraph_tv_dual_step: float = 0.02,
+        hypergraph_tv_tolerance: float = 1e-4,
     ):
         super().__init__()
         if device.startswith("cuda") and not torch.cuda.is_available():
@@ -89,6 +98,26 @@ class FoRIS(nn.Module):
         self.reference_counterfactual_blend = float(reference_counterfactual_blend)
         if not 0.0 <= self.reference_counterfactual_blend <= 1.0:
             raise ValueError("reference_counterfactual_blend must be in [0, 1]")
+        if hypergraph_tv and not reference_counterfactual_view:
+            raise ValueError("hypergraph_tv requires reference_counterfactual_view=True")
+        if hypergraph_tv_lambda < 0 or hypergraph_tv_iterations < 1:
+            raise ValueError("Invalid hypergraph TV lambda or iteration count")
+        if not 0.0 <= hypergraph_tv_local_similarity <= 1.0:
+            raise ValueError("hypergraph_tv_local_similarity must be in [0, 1]")
+        if not 0.0 < hypergraph_tv_anchor_ratio <= 1.0:
+            raise ValueError("hypergraph_tv_anchor_ratio must be in (0, 1]")
+        if hypergraph_tv_primal_step <= 0 or hypergraph_tv_dual_step <= 0:
+            raise ValueError("Hypergraph TV primal and dual steps must be positive")
+        if hypergraph_tv_tolerance < 0:
+            raise ValueError("hypergraph_tv_tolerance must be non-negative")
+        self.hypergraph_tv = bool(hypergraph_tv)
+        self.hypergraph_tv_lambda = float(hypergraph_tv_lambda)
+        self.hypergraph_tv_iterations = int(hypergraph_tv_iterations)
+        self.hypergraph_tv_local_similarity = float(hypergraph_tv_local_similarity)
+        self.hypergraph_tv_anchor_ratio = float(hypergraph_tv_anchor_ratio)
+        self.hypergraph_tv_primal_step = float(hypergraph_tv_primal_step)
+        self.hypergraph_tv_dual_step = float(hypergraph_tv_dual_step)
+        self.hypergraph_tv_tolerance = float(hypergraph_tv_tolerance)
 
 
         if mask_refiner == "crf":
@@ -104,6 +133,7 @@ class FoRIS(nn.Module):
 
         self.should_debiass = True
         self.last_reference_counterfactual_analysis = None
+        self.last_hypergraph_tv_analysis = None
 
     # ──────────────────────── Public API ────────────────────────
 
@@ -240,9 +270,39 @@ class FoRIS(nn.Module):
             tgt_feat=tgt_feat_denoised,
         )
 
+        score_is_normalized = False
+        if self.hypergraph_tv:
+            view_reliability = self._n2_view_reliability(
+                ref_feats=fmaps_norm[:, :S],
+                ref_feats_counterfactual=ref_feats_fg_view,
+                ref_masks=ref_masks,
+                tgt_feat=fmaps_norm[:, S],
+                n_refs=S,
+                h=h,
+                w=w,
+            )
+            score, self.last_hypergraph_tv_analysis = hypergraph_tv_refine(
+                score,
+                fmaps_norm[0, S],
+                sf,
+                sbn,
+                view_reliability,
+                lam=self.hypergraph_tv_lambda,
+                iterations=self.hypergraph_tv_iterations,
+                local_similarity_threshold=self.hypergraph_tv_local_similarity,
+                anchor_ratio=self.hypergraph_tv_anchor_ratio,
+                primal_step=self.hypergraph_tv_primal_step,
+                dual_step=self.hypergraph_tv_dual_step,
+                tolerance=self.hypergraph_tv_tolerance,
+            )
+            score_is_normalized = True
+        else:
+            self.last_hypergraph_tv_analysis = {"enabled": False}
+
         denoised_mask = self._binarize_response(
             score,
             target_hw=(tgt_image.shape[-2], tgt_image.shape[-1]),
+            pre_normalized=score_is_normalized,
         )
         return self._finalize_mask(denoised_mask, tgt_image)
 
@@ -270,16 +330,52 @@ class FoRIS(nn.Module):
         fill = torch.where(background_count > 0, background_mean, image_mean)
         return ref_images * mask + fill * background
 
+    def _n2_view_reliability(
+        self,
+        *,
+        ref_feats: torch.Tensor,
+        ref_feats_counterfactual: torch.Tensor | None,
+        ref_masks: torch.Tensor,
+        tgt_feat: torch.Tensor,
+        n_refs: int,
+        h: int,
+        w: int,
+    ) -> torch.Tensor:
+        """Estimate target-wise agreement between original and N2 counterfactual FG views."""
+        if ref_feats_counterfactual is None:
+            return torch.ones((h, w), device=tgt_feat.device, dtype=tgt_feat.dtype)
+        original_means: list[torch.Tensor] = []
+        counterfactual_means: list[torch.Tensor] = []
+        for shot in range(n_refs):
+            mask = downsample_mask(ref_masks[shot : shot + 1], h, w)
+            original = ref_feats[0, shot][:, mask]
+            counterfactual = ref_feats_counterfactual[0, shot][:, mask]
+            if original.shape[1] > 0:
+                original_means.append(original.mean(dim=1))
+                counterfactual_means.append(counterfactual.mean(dim=1))
+        if not original_means:
+            return torch.ones((h, w), device=tgt_feat.device, dtype=tgt_feat.dtype)
+        original_proto = F.normalize(torch.stack(original_means).mean(dim=0), p=2, dim=0)
+        counterfactual_proto = F.normalize(
+            torch.stack(counterfactual_means).mean(dim=0), p=2, dim=0
+        )
+        original_score = torch.einsum("bchw,c->bhw", tgt_feat, original_proto)[0]
+        counterfactual_score = torch.einsum(
+            "bchw,c->bhw", tgt_feat, counterfactual_proto
+        )[0]
+        return torch.exp(-(original_score - counterfactual_score).abs() / 0.1)
+
     def _binarize_response(
         self,
         score_hw: torch.Tensor,
         *,
         target_hw: tuple[int, int],
+        pre_normalized: bool = False,
     ) -> torch.Tensor:
         """Min-max normalize response, upsample, then threshold."""
         t = 0.5
-        score = score_hw - score_hw.min()
-        score = score / score.max().clamp_min(1e-6)
+        score = score_hw if pre_normalized else score_hw - score_hw.min()
+        score = score if pre_normalized else score / score.max().clamp_min(1e-6)
         H, W = target_hw
         score = F.interpolate(
             score.unsqueeze(0).unsqueeze(0),

@@ -68,6 +68,18 @@ def get_args_parser() -> argparse.ArgumentParser:
         type=float,
         help="Counterfactual contribution to Stage2 FG prototypes.",
     )
+    parser.add_argument(
+        "--hypergraph-tv",
+        action="store_true",
+        help="Apply post-Part4 training-free hypergraph total-variation refinement.",
+    )
+    parser.add_argument("--hypergraph-tv-lambda", default=0.05, type=float)
+    parser.add_argument("--hypergraph-tv-iterations", default=50, type=int)
+    parser.add_argument("--hypergraph-tv-local-similarity", default=0.5, type=float)
+    parser.add_argument("--hypergraph-tv-anchor-ratio", default=0.1, type=float)
+    parser.add_argument("--hypergraph-tv-primal-step", default=0.02, type=float)
+    parser.add_argument("--hypergraph-tv-dual-step", default=0.02, type=float)
+    parser.add_argument("--hypergraph-tv-tolerance", default=1e-4, type=float)
 
     # Dataset
     parser.add_argument(

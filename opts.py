@@ -83,6 +83,13 @@ def get_args_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hypergraph-tv-primal-step", default=0.02, type=float)
     parser.add_argument("--hypergraph-tv-dual-step", default=0.02, type=float)
     parser.add_argument("--hypergraph-tv-tolerance", default=1e-4, type=float)
+    parser.add_argument(
+        "--hypergraph-tv-evidence-interval", action="store_true",
+        help="Use Part2/Part3 evidence disagreement to relax Hypergraph-TV fidelity.",
+    )
+    parser.add_argument("--hypergraph-tv-evidence-interval-max-width", default=0.15, type=float)
+    parser.add_argument("--hypergraph-tv-evidence-interval-scale", default=0.3, type=float)
+    parser.add_argument("--hypergraph-tv-evidence-interval-epsilon", default=0.1, type=float)
 
     # Dataset
     parser.add_argument(

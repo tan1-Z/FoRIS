@@ -56,6 +56,10 @@ class FoRIS(nn.Module):
         hypergraph_tv_primal_step: float = 0.02,
         hypergraph_tv_dual_step: float = 0.02,
         hypergraph_tv_tolerance: float = 1e-4,
+        hypergraph_tv_evidence_interval: bool = False,
+        hypergraph_tv_evidence_interval_max_width: float = 0.15,
+        hypergraph_tv_evidence_interval_scale: float = 0.3,
+        hypergraph_tv_evidence_interval_epsilon: float = 0.1,
     ):
         super().__init__()
         if device.startswith("cuda") and not torch.cuda.is_available():
@@ -119,6 +123,12 @@ class FoRIS(nn.Module):
             raise ValueError("Hypergraph TV primal and dual steps must be positive")
         if hypergraph_tv_tolerance < 0:
             raise ValueError("hypergraph_tv_tolerance must be non-negative")
+        if hypergraph_tv_evidence_interval_max_width < 0.0:
+            raise ValueError("hypergraph_tv_evidence_interval_max_width must be non-negative")
+        if hypergraph_tv_evidence_interval_scale < 0.0:
+            raise ValueError("hypergraph_tv_evidence_interval_scale must be non-negative")
+        if not 0.0 < hypergraph_tv_evidence_interval_epsilon <= 1.0:
+            raise ValueError("hypergraph_tv_evidence_interval_epsilon must be in (0, 1]")
         self.hypergraph_tv = bool(hypergraph_tv)
         self.hypergraph_tv_lambda = float(hypergraph_tv_lambda)
         self.hypergraph_tv_iterations = int(hypergraph_tv_iterations)
@@ -132,6 +142,16 @@ class FoRIS(nn.Module):
         self.hypergraph_tv_primal_step = float(hypergraph_tv_primal_step)
         self.hypergraph_tv_dual_step = float(hypergraph_tv_dual_step)
         self.hypergraph_tv_tolerance = float(hypergraph_tv_tolerance)
+        self.hypergraph_tv_evidence_interval = bool(hypergraph_tv_evidence_interval)
+        self.hypergraph_tv_evidence_interval_max_width = float(
+            hypergraph_tv_evidence_interval_max_width
+        )
+        self.hypergraph_tv_evidence_interval_scale = float(
+            hypergraph_tv_evidence_interval_scale
+        )
+        self.hypergraph_tv_evidence_interval_epsilon = float(
+            hypergraph_tv_evidence_interval_epsilon
+        )
 
 
         if mask_refiner == "crf":
@@ -311,6 +331,11 @@ class FoRIS(nn.Module):
                 primal_step=self.hypergraph_tv_primal_step,
                 dual_step=self.hypergraph_tv_dual_step,
                 tolerance=self.hypergraph_tv_tolerance,
+                evidence_interval=self.hypergraph_tv_evidence_interval,
+                evidence_maps=(sf, 1.0 - sbn, cand_soft, seed_prior),
+                evidence_interval_max_width=self.hypergraph_tv_evidence_interval_max_width,
+                evidence_interval_scale=self.hypergraph_tv_evidence_interval_scale,
+                evidence_interval_epsilon=self.hypergraph_tv_evidence_interval_epsilon,
             )
             score_is_normalized = True
         else:

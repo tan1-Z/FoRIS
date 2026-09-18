@@ -126,6 +126,57 @@ def _project_scaled_simplex(values: torch.Tensor, mass: torch.Tensor, valid: tor
     return projected.masked_fill(~valid, 0.0).reshape(original_shape)
 
 
+def _evidence_interval(
+    evidence_maps: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    *,
+    max_width: float,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build an uncalibrated, evidence-disagreement interval around each score."""
+    evidence = torch.stack([item.clamp(0.0, 1.0) for item in evidence_maps], dim=0)
+    median = evidence.median(dim=0).values
+    disagreement = (evidence - median).abs().mean(dim=0)
+    width = (scale * disagreement).clamp(0.0, max_width)
+    return width, disagreement, median
+
+
+def _interval_fidelity_prox(
+    proposal: torch.Tensor,
+    s0: torch.Tensor,
+    fidelity: torch.Tensor,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+    *,
+    primal_step: float,
+    epsilon: float,
+) -> torch.Tensor:
+    """Exact separable proximal map for interval fidelity plus an s0 tether."""
+    interval_weight = fidelity - epsilon
+    middle = (proposal + primal_step * epsilon * s0) / (1.0 + primal_step * epsilon)
+    middle = middle.clamp(min=lower, max=upper)
+    lower_candidate = (
+        proposal + primal_step * (epsilon * s0 + interval_weight * lower)
+    ) / (1.0 + primal_step * (epsilon + interval_weight))
+    lower_candidate = torch.minimum(lower_candidate, lower)
+    upper_candidate = (
+        proposal + primal_step * (epsilon * s0 + interval_weight * upper)
+    ) / (1.0 + primal_step * (epsilon + interval_weight))
+    upper_candidate = torch.maximum(upper_candidate, upper)
+
+    def energy(candidate: torch.Tensor) -> torch.Tensor:
+        distance = (candidate - candidate.clamp(min=lower, max=upper)).square()
+        return (
+            0.5 * (candidate - proposal).square() / primal_step
+            + 0.5 * interval_weight * distance
+            + 0.5 * epsilon * (candidate - s0).square()
+        )
+
+    candidates = torch.stack([lower_candidate, middle, upper_candidate], dim=0)
+    energies = torch.stack([energy(item) for item in candidates], dim=0)
+    best = energies.argmin(dim=0, keepdim=True)
+    return candidates.gather(0, best).squeeze(0).clamp(0.0, 1.0)
+
+
 def _build_hyperedges_fast(
     target_features: torch.Tensor,
     sf: torch.Tensor,
@@ -282,6 +333,11 @@ def hypergraph_tv_refine(
     primal_step: float,
     dual_step: float,
     tolerance: float,
+    evidence_interval: bool = False,
+    evidence_maps: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    evidence_interval_max_width: float = 0.15,
+    evidence_interval_scale: float = 0.3,
+    evidence_interval_epsilon: float = 0.1,
 ) -> tuple[torch.Tensor, dict[str, float | int]]:
     """Minimize fidelity plus weighted hyperedge range TV with PDHG.
 
@@ -298,6 +354,9 @@ def hypergraph_tv_refine(
         or not -1.0 <= fg_anchor_margin <= 1.0
         or not -1.0 <= bg_anchor_margin <= 1.0
         or not 0.0 <= min_fg_view_reliability <= 1.0
+        or evidence_interval_max_width < 0.0
+        or evidence_interval_scale < 0.0
+        or not 0.0 < evidence_interval_epsilon <= 1.0
     ):
         raise ValueError("Invalid hypergraph TV configuration")
 
@@ -352,6 +411,22 @@ def hypergraph_tv_refine(
     destination_index = edge_nodes.unsqueeze(1).expand(-1, max_nodes, -1)
 
     fidelity = 1.0 + 4.0 * (s0.reshape(-1) - 0.5).abs()
+    interval_width = None
+    interval_disagreement = None
+    if evidence_interval:
+        if evidence_maps is None or any(item.shape != score.shape for item in evidence_maps):
+            raise ValueError("evidence_maps must contain four [H,W] maps when evidence_interval is enabled")
+        if not all(torch.isfinite(item).all() for item in evidence_maps):
+            raise ValueError("evidence_maps contain non-finite values")
+        interval_width, interval_disagreement, _ = _evidence_interval(
+            evidence_maps,
+            max_width=evidence_interval_max_width,
+            scale=evidence_interval_scale,
+        )
+        lower = (s0 - interval_width).clamp(0.0, 1.0).reshape(-1)
+        upper = (s0 + interval_width).clamp(0.0, 1.0).reshape(-1)
+    else:
+        lower = upper = None
     z = s0.reshape(-1).clone()
     z_bar = z.clone()
     dual = torch.zeros((num_edges, max_nodes, max_nodes), device=score.device, dtype=score.dtype)
@@ -386,8 +461,14 @@ def hypergraph_tv_refine(
         )
         old_z = z
         proposal = z - primal_step * gradient
-        z = ((proposal + primal_step * fidelity * s0.reshape(-1)) /
-             (1.0 + primal_step * fidelity)).clamp(0.0, 1.0)
+        if evidence_interval:
+            z = _interval_fidelity_prox(
+                proposal, s0.reshape(-1), fidelity, lower, upper,
+                primal_step=primal_step, epsilon=evidence_interval_epsilon,
+            )
+        else:
+            z = ((proposal + primal_step * fidelity * s0.reshape(-1)) /
+                 (1.0 + primal_step * fidelity)).clamp(0.0, 1.0)
         z_bar = (2.0 * z - old_z).clamp(0.0, 1.0)
         primal_residual = float((z - old_z).abs().max().item())
         dual_residual = float((dual - old_dual).abs().max().item())
@@ -406,5 +487,19 @@ def hypergraph_tv_refine(
         "fallback": False,
         "lambda_zero_identity": False,
         "mean_absolute_score_change": float((z - s0.reshape(-1)).abs().mean().item()),
+        "evidence_interval": bool(evidence_interval),
+        "evidence_interval_max_width": float(evidence_interval_max_width),
+        "evidence_interval_scale": float(evidence_interval_scale),
+        "evidence_interval_epsilon": float(evidence_interval_epsilon),
+        "evidence_interval_mean_width": (
+            float(interval_width.mean().item()) if interval_width is not None else 0.0
+        ),
+        "evidence_interval_max_observed_width": (
+            float(interval_width.max().item()) if interval_width is not None else 0.0
+        ),
+        "evidence_interval_mean_disagreement": (
+            float(interval_disagreement.mean().item())
+            if interval_disagreement is not None else 0.0
+        ),
     }
     return z.view(height, width), diagnostics

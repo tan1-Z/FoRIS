@@ -184,6 +184,9 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
         "mean_hyperedge_weight", "mean_node_degree", "max_node_degree",
         "iterations", "primal_residual", "dual_residual",
         "mean_absolute_score_change",
+        "evidence_interval_mean_width",
+        "evidence_interval_max_observed_width",
+        "evidence_interval_mean_disagreement",
     )
     tv_summary = {
         "artifact_type": "module_diagnostics",
@@ -200,6 +203,10 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
         "primal_step": float(args.hypergraph_tv_primal_step),
         "dual_step": float(args.hypergraph_tv_dual_step),
         "tolerance": float(args.hypergraph_tv_tolerance),
+        "evidence_interval": bool(args.hypergraph_tv_evidence_interval),
+        "evidence_interval_max_width": float(args.hypergraph_tv_evidence_interval_max_width),
+        "evidence_interval_scale": float(args.hypergraph_tv_evidence_interval_scale),
+        "evidence_interval_epsilon": float(args.hypergraph_tv_evidence_interval_epsilon),
         "num_episodes": len(hypergraph_tv_records),
         "fallback_count": int(sum(
             record.get("fallback", False) for record in hypergraph_tv_records

@@ -78,6 +78,10 @@ def build_foris(
     hypergraph_tv_primal_step: float = 0.02,
     hypergraph_tv_dual_step: float = 0.02,
     hypergraph_tv_tolerance: float = 1e-4,
+    hypergraph_tv_evidence_interval: bool = False,
+    hypergraph_tv_evidence_interval_max_width: float = 0.15,
+    hypergraph_tv_evidence_interval_scale: float = 0.3,
+    hypergraph_tv_evidence_interval_epsilon: float = 0.1,
 ):
     encoder = _build_encoder(model_size)
     model = FoRIS(
@@ -101,6 +105,10 @@ def build_foris(
         hypergraph_tv_primal_step=hypergraph_tv_primal_step,
         hypergraph_tv_dual_step=hypergraph_tv_dual_step,
         hypergraph_tv_tolerance=hypergraph_tv_tolerance,
+        hypergraph_tv_evidence_interval=hypergraph_tv_evidence_interval,
+        hypergraph_tv_evidence_interval_max_width=hypergraph_tv_evidence_interval_max_width,
+        hypergraph_tv_evidence_interval_scale=hypergraph_tv_evidence_interval_scale,
+        hypergraph_tv_evidence_interval_epsilon=hypergraph_tv_evidence_interval_epsilon,
     )
     for param in model.parameters():
         param.requires_grad = False
@@ -129,4 +137,8 @@ def build_foris_from_args(args):
         hypergraph_tv_primal_step=args.hypergraph_tv_primal_step,
         hypergraph_tv_dual_step=args.hypergraph_tv_dual_step,
         hypergraph_tv_tolerance=args.hypergraph_tv_tolerance,
+        hypergraph_tv_evidence_interval=args.hypergraph_tv_evidence_interval,
+        hypergraph_tv_evidence_interval_max_width=args.hypergraph_tv_evidence_interval_max_width,
+        hypergraph_tv_evidence_interval_scale=args.hypergraph_tv_evidence_interval_scale,
+        hypergraph_tv_evidence_interval_epsilon=args.hypergraph_tv_evidence_interval_epsilon,
     )

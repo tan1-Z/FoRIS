@@ -14,6 +14,11 @@ from PIL import Image
 
 from utils.clustering import agglomerative_clustering, compute_cluster_prototypes
 from utils.data import build_transform, denormalize, downsample_mask
+from utils.evidence_hypergraph import (
+    ClusterHypergraph,
+    CorrespondenceHypergraph,
+    prototype_soft_hyperedge_potential,
+)
 from utils.hypergraph_tv import hypergraph_tv_refine
 from utils.refinement import crf_refine, init_crf, upsample_mask
 
@@ -752,11 +757,11 @@ class FoRIS(nn.Module):
         mu_bg = orth / n.clamp_min(1e-8)
 
         # Foreground scoring: clustered multi-prototypes via log-sum-exp aggregation.
-        sim_khw = torch.einsum(
-            "bchw,kc->bkhw", target_feat_for_cluster, fg_protos
-        )  # (1, K, h, w)
-        t = max(1e-4, self.cluster_logsumexp_temp)
-        sim_fg_hw = (t * torch.logsumexp(sim_khw / t, dim=1)).squeeze(0)  # (h, w)
+        sim_fg_hw, _ = prototype_soft_hyperedge_potential(
+            target_feat_for_cluster,
+            fg_protos,
+            temperature=self.cluster_logsumexp_temp,
+        )
 
         sim_bg_hw = torch.einsum("bchw,c->bhw", target_feat_for_score, mu_bg)
         sb = sim_bg_hw.squeeze(0)  # (h, w)
@@ -828,7 +833,8 @@ class FoRIS(nn.Module):
         dtype = tgt_feat.dtype
         tgt_norm = F.normalize(tgt_feat, p=2, dim=1)
 
-        votes = torch.zeros((h, w), dtype=torch.int32, device=device)
+        matched_indices: list[torch.Tensor] = []
+        reference_memberships: list[torch.Tensor] = []
         for m in range(n_refs):
             # [1, C, H, W]: match target's per-patch channel normalization.
             ref_m = F.normalize(ref_feats[0:1, m], p=2, dim=1)
@@ -837,14 +843,22 @@ class FoRIS(nn.Module):
             Hs, Ws = sim0.shape[:2]
             sim_t_to_r = sim0.permute(2, 3, 0, 1)
             best_idx = sim_t_to_r.reshape(h, w, -1).argmax(dim=2)
-            rows = best_idx // Ws
-            cols = best_idx % Ws
             ref_mask_m = downsample_mask(ref_masks[m : m + 1], Hs, Ws).squeeze(0)
-            votes += ref_mask_m[rows, cols].to(torch.int32)
+            matched_indices.append(best_idx)
+            reference_memberships.append(ref_mask_m)
+
+        correspondence = CorrespondenceHypergraph(
+            matched_reference_indices=tuple(matched_indices),
+            target_shape=(h, w),
+        )
+        vote_soft = correspondence.vote_reference_membership(
+            tuple(reference_memberships), dtype=dtype,
+        )
+        votes = vote_soft.to(torch.int32)
 
         candidates_mask = votes >= math.ceil(n_refs / 2)
 
-        vote_soft = votes.to(dtype=dtype) / float(max(1, n_refs))
+        vote_soft = vote_soft / float(max(1, n_refs))
 
         return candidates_mask,  vote_soft
 
@@ -896,7 +910,8 @@ class FoRIS(nn.Module):
             x_cluster = F.normalize(x_cluster, p=2, dim=1)
 
         labels = agglomerative_clustering(x_cluster, tau=self.tau)
-        k = int(labels.max().item()) + 1
+        cluster_hypergraph = ClusterHypergraph.from_labels(labels)
+        k = cluster_hypergraph.num_hyperedges
         if k <= 1:
             return candidate_mask.to(dtype=tgt_feat.dtype)
 
@@ -918,21 +933,15 @@ class FoRIS(nn.Module):
         if matched.numel() == 0:
             return candidate_mask.to(dtype=tgt_feat.dtype)
 
-        matched_ids, counts = matched.unique(return_counts=True)
+        matched_ids = matched.unique()
 
-        area_all = torch.bincount(labels, minlength=k).to(dtype=protos.dtype).clamp_min(1.0)
-        area_w = torch.zeros(k, device=protos.device, dtype=protos.dtype)
-        area_w[matched_ids] = counts.to(dtype=protos.dtype)
-        area_w = area_w / area_all
+        area_all = cluster_hypergraph.member_counts(dtype=protos.dtype).clamp_min(1.0)
+        area_w = cluster_hypergraph.candidate_counts(
+            candidate_mask, dtype=protos.dtype,
+        ) / area_all
 
         fg_sim_map = torch.einsum("chw,c->hw", feat_tgt, mu_fg)
-        cross_sim = torch.zeros(k, device=protos.device, dtype=protos.dtype)
-        labels_flat = labels.view(-1)
-        fg_sim_flat = fg_sim_map.view(-1)
-        for i in range(k):
-            mask_i = labels_flat == i
-            if mask_i.any():
-                cross_sim[i] = fg_sim_flat[mask_i].mean()
+        cross_sim = cluster_hypergraph.pool_mean(fg_sim_map)
 
         seed_scores = cross_sim * area_w
         seed_cluster = int(matched_ids[torch.argmax(seed_scores[matched_ids])].item())
@@ -943,7 +952,7 @@ class FoRIS(nn.Module):
 
         lo, hi = combined.min(), combined.max()
         combined = (combined - lo) / (hi - lo).clamp_min(1e-6)
-        return combined[labels].view(h, w)
+        return cluster_hypergraph.broadcast(combined).view(h, w)
 
     def _part3_clustering(
         self,
@@ -1043,18 +1052,16 @@ class FoRIS(nn.Module):
         xt = tgt_feat.squeeze(0).permute(1, 2, 0).reshape(h_t * w_t, c_t)
         xt = F.normalize(xt, p=2, dim=1)
         labels_t = agglomerative_clustering(xt, tau=self.tau)
-        k_t = int(labels_t.max().item()) + 1
+        cluster_hypergraph = ClusterHypergraph.from_labels(labels_t)
+        k_t = cluster_hypergraph.num_hyperedges
 
-        sf_flat = sf.reshape(-1)
-        sb_flat = sbn.reshape(-1)
+        sf_mean = cluster_hypergraph.pool_mean(sf)
+        sb_mean = cluster_hypergraph.pool_mean(sbn)
         delta_cluster = torch.zeros(k_t, device=sf.device, dtype=sf.dtype)
 
         for k_idx in range(k_t):
-            mk = labels_t == k_idx
-            if not bool(mk.any()):
-                continue
-            fg_mean = sf_flat[mk].mean()
-            bg_mean = sb_flat[mk].mean()
+            fg_mean = sf_mean[k_idx]
+            bg_mean = sb_mean[k_idx]
             fg_pure = (fg_mean - bg_mean).clamp_min(0.0)
             conflict = torch.minimum(fg_mean, bg_mean)
             delta_k = (
@@ -1063,7 +1070,7 @@ class FoRIS(nn.Module):
             )
             delta_cluster[k_idx] = delta_k.clamp_min(-self.semantic_cluster_neg_cap)
 
-        return delta_cluster[labels_t].view(h_t, w_t)
+        return cluster_hypergraph.broadcast(delta_cluster).view(h_t, w_t)
 
     def _part4_semantic_consistency_correction(
         self,

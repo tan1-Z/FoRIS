@@ -56,6 +56,9 @@ class FoRIS(nn.Module):
         hypergraph_tv_primal_step: float = 0.02,
         hypergraph_tv_dual_step: float = 0.02,
         hypergraph_tv_tolerance: float = 1e-4,
+        hypergraph_tv_second_order: bool = False,
+        hypergraph_tv_second_order_lambda: float = 0.01,
+        hypergraph_tv_second_order_rgb_quantile: float = 0.75,
         hypergraph_tv_evidence_interval: bool = False,
         hypergraph_tv_evidence_interval_max_width: float = 0.15,
         hypergraph_tv_evidence_interval_scale: float = 0.3,
@@ -123,6 +126,10 @@ class FoRIS(nn.Module):
             raise ValueError("Hypergraph TV primal and dual steps must be positive")
         if hypergraph_tv_tolerance < 0:
             raise ValueError("hypergraph_tv_tolerance must be non-negative")
+        if hypergraph_tv_second_order_lambda < 0.0:
+            raise ValueError("hypergraph_tv_second_order_lambda must be non-negative")
+        if not 0.0 <= hypergraph_tv_second_order_rgb_quantile <= 1.0:
+            raise ValueError("hypergraph_tv_second_order_rgb_quantile must be in [0, 1]")
         if hypergraph_tv_evidence_interval_max_width < 0.0:
             raise ValueError("hypergraph_tv_evidence_interval_max_width must be non-negative")
         if hypergraph_tv_evidence_interval_scale < 0.0:
@@ -142,6 +149,9 @@ class FoRIS(nn.Module):
         self.hypergraph_tv_primal_step = float(hypergraph_tv_primal_step)
         self.hypergraph_tv_dual_step = float(hypergraph_tv_dual_step)
         self.hypergraph_tv_tolerance = float(hypergraph_tv_tolerance)
+        self.hypergraph_tv_second_order = bool(hypergraph_tv_second_order)
+        self.hypergraph_tv_second_order_lambda = float(hypergraph_tv_second_order_lambda)
+        self.hypergraph_tv_second_order_rgb_quantile = float(hypergraph_tv_second_order_rgb_quantile)
         self.hypergraph_tv_evidence_interval = bool(hypergraph_tv_evidence_interval)
         self.hypergraph_tv_evidence_interval_max_width = float(
             hypergraph_tv_evidence_interval_max_width
@@ -331,6 +341,10 @@ class FoRIS(nn.Module):
                 primal_step=self.hypergraph_tv_primal_step,
                 dual_step=self.hypergraph_tv_dual_step,
                 tolerance=self.hypergraph_tv_tolerance,
+                second_order=self.hypergraph_tv_second_order,
+                second_order_lambda=self.hypergraph_tv_second_order_lambda,
+                second_order_rgb_quantile=self.hypergraph_tv_second_order_rgb_quantile,
+                target_rgb=tgt_image[0],
                 evidence_interval=self.hypergraph_tv_evidence_interval,
                 evidence_maps=(sf, 1.0 - sbn, cand_soft, seed_prior),
                 evidence_interval_max_width=self.hypergraph_tv_evidence_interval_max_width,

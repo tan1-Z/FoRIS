@@ -187,6 +187,8 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
         "evidence_interval_mean_width",
         "evidence_interval_max_observed_width",
         "evidence_interval_mean_disagreement",
+        "num_second_order_stencils", "second_order_mean_weight",
+        "second_order_rgb_limit", "second_order_mean_feature_similarity",
     )
     tv_summary = {
         "artifact_type": "module_diagnostics",
@@ -203,6 +205,9 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
         "primal_step": float(args.hypergraph_tv_primal_step),
         "dual_step": float(args.hypergraph_tv_dual_step),
         "tolerance": float(args.hypergraph_tv_tolerance),
+        "second_order": bool(args.hypergraph_tv_second_order),
+        "second_order_lambda": float(args.hypergraph_tv_second_order_lambda),
+        "second_order_rgb_quantile": float(args.hypergraph_tv_second_order_rgb_quantile),
         "evidence_interval": bool(args.hypergraph_tv_evidence_interval),
         "evidence_interval_max_width": float(args.hypergraph_tv_evidence_interval_max_width),
         "evidence_interval_scale": float(args.hypergraph_tv_evidence_interval_scale),

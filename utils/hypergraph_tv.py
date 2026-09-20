@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 
 
+
 def _local_neighborhood_edges(
     features: torch.Tensor,
     *,
@@ -315,6 +316,78 @@ def _build_hyperedges_fast(
     return edge_nodes, fixed_values, weights, degree, counts
 
 
+def _build_second_order_stencils(
+    target_features: torch.Tensor,
+    target_rgb: torch.Tensor,
+    *,
+    similarity_threshold: float,
+    rgb_quantile: float,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float | int]]:
+    """Build fixed three-node stencils for signed second-order TV.
+
+    A stencil is retained only when both adjacent semantic links are coherent
+    and neither link crosses a strong RGB discontinuity.  The middle node is
+    always the second column of the returned ``[i, j, k]`` triple.
+    """
+    if not 0.0 <= rgb_quantile <= 1.0:
+        raise ValueError("second-order RGB quantile must be in [0, 1]")
+    channels, height, width = target_features.shape
+    tokens = F.normalize(
+        target_features.permute(1, 2, 0).reshape(-1, channels), p=2, dim=1
+    )
+    rgb = F.interpolate(
+        target_rgb.unsqueeze(0), size=(height, width), mode="bilinear", align_corners=False,
+    )[0].permute(1, 2, 0).reshape(-1, target_rgb.shape[0])
+    rows = torch.arange(height, device=target_features.device)
+    cols = torch.arange(width, device=target_features.device)
+    grid_rows, grid_cols = torch.meshgrid(rows, cols, indexing="ij")
+    triples: list[torch.Tensor] = []
+    similarities: list[torch.Tensor] = []
+    rgb_deltas: list[torch.Tensor] = []
+    for row_step, col_step in ((0, 1), (1, 0), (1, 1), (1, -1)):
+        middle_rows = grid_rows
+        middle_cols = grid_cols
+        valid = (
+            (middle_rows - row_step >= 0) & (middle_rows + row_step < height)
+            & (middle_cols - col_step >= 0) & (middle_cols + col_step < width)
+        )
+        middle = (middle_rows * width + middle_cols)[valid]
+        first = ((middle_rows - row_step) * width + (middle_cols - col_step))[valid]
+        last = ((middle_rows + row_step) * width + (middle_cols + col_step))[valid]
+        triples.append(torch.stack([first, middle, last], dim=1))
+        similarities.append(torch.stack([
+            (tokens[first] * tokens[middle]).sum(dim=1),
+            (tokens[middle] * tokens[last]).sum(dim=1),
+        ], dim=1))
+        rgb_deltas.append(torch.stack([
+            (rgb[first] - rgb[middle]).square().sum(dim=1).sqrt(),
+            (rgb[middle] - rgb[last]).square().sum(dim=1).sqrt(),
+        ], dim=1))
+    indices = torch.cat(triples, dim=0)
+    pair_similarity = torch.cat(similarities, dim=0)
+    pair_rgb_delta = torch.cat(rgb_deltas, dim=0)
+    rgb_limit = torch.quantile(pair_rgb_delta.reshape(-1), rgb_quantile)
+    keep = (
+        (pair_similarity >= similarity_threshold).all(dim=1)
+        & (pair_rgb_delta <= rgb_limit).all(dim=1)
+    )
+    indices = indices[keep]
+    if indices.numel() == 0:
+        raise RuntimeError("No second-order stencils passed semantic/RGB gating")
+    weights = pair_similarity[keep].mean(dim=1).clamp_min(0.0)
+    degree = torch.zeros(height * width, device=target_features.device, dtype=target_features.dtype)
+    degree.scatter_add_(0, indices.reshape(-1), torch.ones_like(indices.reshape(-1), dtype=target_features.dtype))
+    stencil_degree = degree[indices].mean(dim=1).clamp_min(1.0)
+    weights = weights / stencil_degree
+    weights = weights / weights.mean().clamp_min(1e-6)
+    return indices, weights, {
+        "num_second_order_stencils": int(indices.shape[0]),
+        "second_order_mean_weight": float(weights.mean().item()),
+        "second_order_rgb_limit": float(rgb_limit.item()),
+        "second_order_mean_feature_similarity": float(pair_similarity[keep].mean().item()),
+    }
+
+
 @torch.no_grad()
 def hypergraph_tv_refine(
     score: torch.Tensor,
@@ -333,6 +406,10 @@ def hypergraph_tv_refine(
     primal_step: float,
     dual_step: float,
     tolerance: float,
+    second_order: bool = False,
+    second_order_lambda: float = 0.01,
+    second_order_rgb_quantile: float = 0.75,
+    target_rgb: torch.Tensor | None = None,
     evidence_interval: bool = False,
     evidence_maps: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     evidence_interval_max_width: float = 0.15,
@@ -357,6 +434,8 @@ def hypergraph_tv_refine(
         or evidence_interval_max_width < 0.0
         or evidence_interval_scale < 0.0
         or not 0.0 < evidence_interval_epsilon <= 1.0
+        or second_order_lambda < 0.0
+        or not 0.0 <= second_order_rgb_quantile <= 1.0
     ):
         raise ValueError("Invalid hypergraph TV configuration")
 
@@ -427,10 +506,38 @@ def hypergraph_tv_refine(
         upper = (s0 + interval_width).clamp(0.0, 1.0).reshape(-1)
     else:
         lower = upper = None
+    second_order_indices = None
+    second_order_weights = None
+    second_order_counts: dict[str, float | int] = {
+        "num_second_order_stencils": 0,
+        "second_order_mean_weight": 0.0,
+        "second_order_rgb_limit": 0.0,
+        "second_order_mean_feature_similarity": 0.0,
+    }
+    if second_order and second_order_lambda > 0.0:
+        if target_rgb is None or target_rgb.ndim != 3:
+            raise ValueError("target_rgb [C,H,W] is required when second_order is enabled")
+        try:
+            second_order_indices, second_order_weights, second_order_counts = _build_second_order_stencils(
+                target_features,
+                target_rgb,
+                similarity_threshold=local_similarity_threshold,
+                rgb_quantile=second_order_rgb_quantile,
+            )
+        except RuntimeError as error:
+            second_order_counts["second_order_fallback_reason"] = str(error)
     z = s0.reshape(-1).clone()
     z_bar = z.clone()
     dual = torch.zeros((num_edges, max_nodes, max_nodes), device=score.device, dtype=score.dtype)
     pair_mass = (lam * weights).clamp_min(1e-8)
+    second_dual = (
+        torch.zeros(second_order_indices.shape[0], device=score.device, dtype=score.dtype)
+        if second_order_indices is not None else None
+    )
+    second_mass = (
+        second_order_lambda * second_order_weights
+        if second_order_weights is not None else None
+    )
     primal_residual = float("inf")
     dual_residual = float("inf")
 
@@ -459,6 +566,21 @@ def hypergraph_tv_refine(
             destination_index[valid_destination],
             -dual[valid_destination],
         )
+        if second_order_indices is not None and second_dual is not None and second_mass is not None:
+            stencil_values = (
+                z_bar[second_order_indices[:, 0]]
+                - 2.0 * z_bar[second_order_indices[:, 1]]
+                + z_bar[second_order_indices[:, 2]]
+            )
+            old_second_dual = second_dual
+            second_dual = (second_dual + dual_step * stencil_values).clamp(
+                min=-second_mass, max=second_mass,
+            )
+            gradient.scatter_add_(0, second_order_indices[:, 0], second_dual)
+            gradient.scatter_add_(0, second_order_indices[:, 1], -2.0 * second_dual)
+            gradient.scatter_add_(0, second_order_indices[:, 2], second_dual)
+        else:
+            old_second_dual = None
         old_z = z
         proposal = z - primal_step * gradient
         if evidence_interval:
@@ -472,8 +594,11 @@ def hypergraph_tv_refine(
         z_bar = (2.0 * z - old_z).clamp(0.0, 1.0)
         primal_residual = float((z - old_z).abs().max().item())
         dual_residual = float((dual - old_dual).abs().max().item())
+        if old_second_dual is not None:
+            dual_residual = max(dual_residual, float((second_dual - old_second_dual).abs().max().item()))
         if max(primal_residual, dual_residual) <= tolerance:
             break
+
 
     diagnostics = {
         "num_hyperedges": int(num_edges),
@@ -501,5 +626,10 @@ def hypergraph_tv_refine(
             float(interval_disagreement.mean().item())
             if interval_disagreement is not None else 0.0
         ),
+        "second_order": bool(second_order),
+        "second_order_lambda": float(second_order_lambda),
+        "second_order_rgb_quantile": float(second_order_rgb_quantile),
+        "second_order_active": second_order_indices is not None,
+        **second_order_counts,
     }
     return z.view(height, width), diagnostics

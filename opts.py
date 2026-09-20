@@ -84,6 +84,12 @@ def get_args_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hypergraph-tv-dual-step", default=0.02, type=float)
     parser.add_argument("--hypergraph-tv-tolerance", default=1e-4, type=float)
     parser.add_argument(
+        "--hypergraph-tv-second-order", action="store_true",
+        help="Add signed second-order local stencil regularization to Hypergraph TV.",
+    )
+    parser.add_argument("--hypergraph-tv-second-order-lambda", default=0.01, type=float)
+    parser.add_argument("--hypergraph-tv-second-order-rgb-quantile", default=0.75, type=float)
+    parser.add_argument(
         "--hypergraph-tv-evidence-interval", action="store_true",
         help="Use Part2/Part3 evidence disagreement to relax Hypergraph-TV fidelity.",
     )

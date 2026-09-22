@@ -152,6 +152,9 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
         "num_episodes": len(evaluation_records),
         "reference_counterfactual_view": bool(args.reference_counterfactual_view),
         "reference_counterfactual_blend": float(args.reference_counterfactual_blend),
+        "reference_counterfactual_adaptive_ensemble": bool(
+            args.reference_counterfactual_adaptive_ensemble
+        ),
         "hypergraph_tv": bool(args.hypergraph_tv),
     }
     evaluation_path = join(args.output_dir, "evaluation.json")
@@ -164,6 +167,10 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
     numeric_keys = (
         "num_fg_tokens", "num_fg_prototypes", "mu_original_view_cosine",
         "prototype_original_view_cosine_mean", "mu_original_fused_cosine",
+        "prototype_blend_mean", "prototype_blend_max",
+        "prototype_instability_mean", "prototype_original_blur_cosine_mean",
+        "prototype_mean_blur_cosine_mean", "mu_original_blur_cosine",
+        "mu_mean_blur_cosine", "global_blend",
     )
     summary = {
         "artifact_type": "module_diagnostics",
@@ -171,6 +178,10 @@ def evaluate(args: argparse.Namespace, model: torch.nn.Module, log_file: str) ->
         "mode": "reference_foreground_counterfactual_view",
         "enabled": bool(args.reference_counterfactual_view),
         "blend": float(args.reference_counterfactual_blend),
+        "adaptive_ensemble": bool(args.reference_counterfactual_adaptive_ensemble),
+        "adaptive_strength": float(args.reference_counterfactual_adaptive_strength),
+        "adaptive_max_blend": float(args.reference_counterfactual_adaptive_max_blend),
+        "blur_kernel": int(args.reference_counterfactual_blur_kernel),
         "num_episodes": len(counterfactual_records),
         "fallback_count": int(sum(record.get("fallback", False) for record in counterfactual_records)),
     }

@@ -50,6 +50,10 @@ class FoRIS(nn.Module):
         semantic_cluster_neg_cap: float = 0.12,
         reference_counterfactual_view: bool = False,
         reference_counterfactual_blend: float = 0.5,
+        reference_counterfactual_adaptive_ensemble: bool = False,
+        reference_counterfactual_adaptive_strength: float = 0.25,
+        reference_counterfactual_adaptive_max_blend: float = 0.50,
+        reference_counterfactual_blur_kernel: int = 33,
         hypergraph_tv: bool = False,
         hypergraph_tv_lambda: float = 0.05,
         hypergraph_tv_iterations: int = 50,
@@ -113,6 +117,29 @@ class FoRIS(nn.Module):
         self.reference_counterfactual_blend = float(reference_counterfactual_blend)
         if not 0.0 <= self.reference_counterfactual_blend <= 1.0:
             raise ValueError("reference_counterfactual_blend must be in [0, 1]")
+        if reference_counterfactual_adaptive_ensemble and not reference_counterfactual_view:
+            raise ValueError(
+                "reference_counterfactual_adaptive_ensemble requires "
+                "reference_counterfactual_view=True"
+            )
+        if reference_counterfactual_adaptive_strength < 0.0:
+            raise ValueError("reference_counterfactual_adaptive_strength must be non-negative")
+        if not 0.0 <= reference_counterfactual_adaptive_max_blend <= 1.0:
+            raise ValueError("reference_counterfactual_adaptive_max_blend must be in [0, 1]")
+        if reference_counterfactual_adaptive_max_blend < self.reference_counterfactual_blend:
+            raise ValueError("adaptive maximum blend must be at least the base blend")
+        if reference_counterfactual_blur_kernel < 3 or reference_counterfactual_blur_kernel % 2 == 0:
+            raise ValueError("reference_counterfactual_blur_kernel must be odd and at least 3")
+        self.reference_counterfactual_adaptive_ensemble = bool(
+            reference_counterfactual_adaptive_ensemble
+        )
+        self.reference_counterfactual_adaptive_strength = float(
+            reference_counterfactual_adaptive_strength
+        )
+        self.reference_counterfactual_adaptive_max_blend = float(
+            reference_counterfactual_adaptive_max_blend
+        )
+        self.reference_counterfactual_blur_kernel = int(reference_counterfactual_blur_kernel)
         if hypergraph_tv and not reference_counterfactual_view:
             raise ValueError("hypergraph_tv requires reference_counterfactual_view=True")
         if hypergraph_tv_lambda < 0 or hypergraph_tv_iterations < 1:
@@ -274,14 +301,30 @@ class FoRIS(nn.Module):
         # Part 1 — positional debiasing
         fmaps_norm = self._part1_positional_debias(fmaps_norm, ref_masks, S)
         ref_feats_fg_view = None
+        ref_feats_fg_blur_view = None
         if self.reference_counterfactual_view:
             counterfactual_images = self._build_reference_counterfactual_images(
-                ref_images, ref_masks_full,
+                ref_images, ref_masks_full, mode="mean",
             )
-            counterfactual_fmaps = self._extract_features(counterfactual_images.unsqueeze(0))
-            ref_feats_fg_view = F.normalize(counterfactual_fmaps, p=2, dim=2)
+            if self.reference_counterfactual_adaptive_ensemble:
+                blur_images = self._build_reference_counterfactual_images(
+                    ref_images,
+                    ref_masks_full,
+                    mode="blur",
+                    blur_kernel=self.reference_counterfactual_blur_kernel,
+                )
+                counterfactual_fmaps = self._extract_features(
+                    torch.cat([counterfactual_images, blur_images], dim=0).unsqueeze(0)
+                )
+                ref_feats_fg_view = F.normalize(counterfactual_fmaps[:, :S], p=2, dim=2)
+                ref_feats_fg_blur_view = F.normalize(counterfactual_fmaps[:, S:], p=2, dim=2)
+            else:
+                counterfactual_fmaps = self._extract_features(counterfactual_images.unsqueeze(0))
+                ref_feats_fg_view = F.normalize(counterfactual_fmaps, p=2, dim=2)
             if self.should_debiass:
                 ref_feats_fg_view = self._debias_features(ref_feats_fg_view)
+                if ref_feats_fg_blur_view is not None:
+                    ref_feats_fg_blur_view = self._debias_features(ref_feats_fg_blur_view)
 
         # Part 2 — two-stage background suppression (stage1 gate + stage2 fg/bg score)
         part2 = self._part2_background_suppression(
@@ -291,6 +334,7 @@ class FoRIS(nn.Module):
             h=h,
             w=w,
             ref_feats_fg_view=ref_feats_fg_view,
+            ref_feats_fg_blur_view=ref_feats_fg_blur_view,
         )
         if part2 is None:
             raise RuntimeError("No foreground tokens in reference mask(s).")
@@ -379,10 +423,28 @@ class FoRIS(nn.Module):
     def _build_reference_counterfactual_images(
         ref_images: torch.Tensor,
         ref_masks: torch.Tensor,
+        *,
+        mode: str = "mean",
+        blur_kernel: int = 33,
     ) -> torch.Tensor:
-        """Replace reference background with its per-image channel mean."""
+        """Replace reference background by a neutral or low-frequency view."""
         mask = ref_masks.unsqueeze(1).to(dtype=ref_images.dtype)
         background = 1.0 - mask
+        if mode == "blur":
+            kernel = min(blur_kernel, ref_images.shape[-2], ref_images.shape[-1])
+            kernel = kernel if kernel % 2 == 1 else kernel - 1
+            if kernel < 3:
+                raise ValueError("Reference image is too small for the blur counterfactual")
+            fill = F.avg_pool2d(
+                ref_images,
+                kernel_size=kernel,
+                stride=1,
+                padding=kernel // 2,
+                count_include_pad=False,
+            )
+            return ref_images * mask + fill * background
+        if mode != "mean":
+            raise ValueError(f"Unknown counterfactual mode: {mode}")
         background_count = background.sum(dim=(-2, -1), keepdim=True)
         background_mean = (ref_images * background).sum(
             dim=(-2, -1), keepdim=True,
@@ -659,6 +721,7 @@ class FoRIS(nn.Module):
         w: int,
         tgt_feat_raw: torch.Tensor,
         ref_feats_fg_view: torch.Tensor | None = None,
+        ref_feats_fg_blur_view: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
         """Part 2 stage 2: fg prototype matching with hard-negative bg suppression."""
         w_bg = float(self.dino_bg_weight)
@@ -723,13 +786,80 @@ class FoRIS(nn.Module):
                 view_prototypes = compute_cluster_prototypes(
                     counterfactual_matrix, labels, K=num_prototypes,
                 )
-                fg_protos = F.normalize(
-                    (1.0 - blend) * original_prototypes + blend * view_prototypes,
-                    p=2, dim=1,
-                )
+                if self.reference_counterfactual_adaptive_ensemble:
+                    if ref_feats_fg_blur_view is None:
+                        raise RuntimeError("Adaptive counterfactual ensemble is missing blur features")
+                    blur_fg: list[torch.Tensor] = []
+                    blur_ref_means: list[torch.Tensor] = []
+                    for shot in range(n_refs):
+                        membership = ref_masks_ds[shot]
+                        blur_tokens = ref_feats_fg_blur_view[0, shot][:, membership]
+                        if blur_tokens.shape[1] > 0:
+                            blur_fg.append(blur_tokens)
+                            blur_ref_means.append(blur_tokens.mean(dim=1))
+                    if len(blur_fg) != len(original_fg):
+                        raise RuntimeError("Blur counterfactual foreground membership mismatch")
+                    blur_matrix = F.normalize(
+                        torch.cat(blur_fg, dim=1).transpose(0, 1), p=2, dim=1,
+                    )
+                    blur_prototypes = compute_cluster_prototypes(
+                        blur_matrix, labels, K=num_prototypes,
+                    )
+                    mu_fg_blur = F.normalize(
+                        torch.stack(blur_ref_means).mean(dim=0), p=2, dim=0,
+                    )
+                    proto_cosines = torch.stack([
+                        (original_prototypes * view_prototypes).sum(dim=1),
+                        (original_prototypes * blur_prototypes).sum(dim=1),
+                        (view_prototypes * blur_prototypes).sum(dim=1),
+                    ], dim=1)
+                    prototype_instability = (1.0 - proto_cosines.mean(dim=1)).clamp(0.0, 1.0)
+                    prototype_blend = (
+                        blend + self.reference_counterfactual_adaptive_strength * prototype_instability
+                    ).clamp(max=self.reference_counterfactual_adaptive_max_blend)
+                    counterfactual_prototypes = F.normalize(
+                        0.5 * view_prototypes + 0.5 * blur_prototypes,
+                        p=2,
+                        dim=1,
+                    )
+                    fg_protos = F.normalize(
+                        (1.0 - prototype_blend.unsqueeze(1)) * original_prototypes
+                        + prototype_blend.unsqueeze(1) * counterfactual_prototypes,
+                        p=2,
+                        dim=1,
+                    )
+                    global_cosines = torch.stack([
+                        torch.dot(mu_fg_original, mu_fg_view),
+                        torch.dot(mu_fg_original, mu_fg_blur),
+                        torch.dot(mu_fg_view, mu_fg_blur),
+                    ])
+                    global_instability = (1.0 - global_cosines.mean()).clamp(0.0, 1.0)
+                    global_blend = min(
+                        self.reference_counterfactual_adaptive_max_blend,
+                        blend + self.reference_counterfactual_adaptive_strength * float(global_instability),
+                    )
+                    counterfactual_mu = F.normalize(
+                        0.5 * mu_fg_view + 0.5 * mu_fg_blur, p=2, dim=0,
+                    )
+                    mu_fg = F.normalize(
+                        (1.0 - global_blend) * mu_fg_original + global_blend * counterfactual_mu,
+                        p=2,
+                        dim=0,
+                    )
+                else:
+                    prototype_blend = torch.full(
+                        (num_prototypes,), blend, device=original_prototypes.device,
+                        dtype=original_prototypes.dtype,
+                    )
+                    fg_protos = F.normalize(
+                        (1.0 - blend) * original_prototypes + blend * view_prototypes,
+                        p=2,
+                        dim=1,
+                    )
                 self.last_reference_counterfactual_analysis = {
                     "enabled": True,
                     "blend": blend,
+                    "adaptive_ensemble": self.reference_counterfactual_adaptive_ensemble,
                     "num_fg_tokens": int(original_matrix.shape[0]),
                     "num_fg_prototypes": num_prototypes,
                     "mu_original_view_cosine": float(torch.dot(mu_fg_original, mu_fg_view)),
@@ -737,8 +867,24 @@ class FoRIS(nn.Module):
                         (original_prototypes * view_prototypes).sum(dim=1).mean()
                     ),
                     "mu_original_fused_cosine": float(torch.dot(mu_fg_original, mu_fg)),
+                    "prototype_blend_mean": float(prototype_blend.mean().item()),
+                    "prototype_blend_max": float(prototype_blend.max().item()),
                     "fallback": False,
                 }
+                if self.reference_counterfactual_adaptive_ensemble:
+                    self.last_reference_counterfactual_analysis.update({
+                        "adaptive_strength": self.reference_counterfactual_adaptive_strength,
+                        "adaptive_max_blend": self.reference_counterfactual_adaptive_max_blend,
+                        "blur_kernel": self.reference_counterfactual_blur_kernel,
+                        "prototype_instability_mean": float(prototype_instability.mean().item()),
+                        "prototype_original_blur_cosine_mean": float(
+                            proto_cosines[:, 1].mean().item()
+                        ),
+                        "prototype_mean_blur_cosine_mean": float(proto_cosines[:, 2].mean().item()),
+                        "mu_original_blur_cosine": float(torch.dot(mu_fg_original, mu_fg_blur)),
+                        "mu_mean_blur_cosine": float(torch.dot(mu_fg_view, mu_fg_blur)),
+                        "global_blend": float(global_blend),
+                    })
             else:
                 self.last_reference_counterfactual_analysis = {
                     "enabled": True, "blend": self.reference_counterfactual_blend,
@@ -781,6 +927,7 @@ class FoRIS(nn.Module):
         h: int,
         w: int,
         ref_feats_fg_view: torch.Tensor | None = None,
+        ref_feats_fg_blur_view: torch.Tensor | None = None,
     ) -> (
         tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
         | None
@@ -802,6 +949,7 @@ class FoRIS(nn.Module):
             w=w,
             tgt_feat_raw=tgt_feat_raw,
             ref_feats_fg_view=ref_feats_fg_view,
+            ref_feats_fg_blur_view=ref_feats_fg_blur_view,
         )
         if stage2 is None:
             return None

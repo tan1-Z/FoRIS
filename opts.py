@@ -69,6 +69,14 @@ def get_args_parser() -> argparse.ArgumentParser:
         help="Counterfactual contribution to Stage2 FG prototypes.",
     )
     parser.add_argument(
+        "--reference-counterfactual-adaptive-ensemble",
+        action="store_true",
+        help="Adapt N2's per-prototype counterfactual blend using mean and low-frequency views.",
+    )
+    parser.add_argument("--reference-counterfactual-adaptive-strength", default=0.25, type=float)
+    parser.add_argument("--reference-counterfactual-adaptive-max-blend", default=0.50, type=float)
+    parser.add_argument("--reference-counterfactual-blur-kernel", default=33, type=int)
+    parser.add_argument(
         "--hypergraph-tv",
         action="store_true",
         help="Apply post-Part4 training-free hypergraph total-variation refinement.",

@@ -38,7 +38,22 @@ def _load_mask(
         mask_array = np.array(mask)
 
     mask_array = mask_array.squeeze()
-    mask_array = mask_array > 0
+    # Image masks are often stored as RGB/RGBA PNGs even when they are
+    # visually binary.  Reduce those channel dimensions before using the
+    # array as a boolean index for an RGB image.
+    if mask_array.ndim == 3:
+        if mask_array.shape[-1] in (1, 3, 4):
+            # Alpha describes transparency rather than foreground membership.
+            mask_array = np.any(mask_array[..., :3] > 0, axis=-1)
+        elif mask_array.shape[0] in (1, 3, 4):
+            mask_array = np.any(mask_array[:3] > 0, axis=0)
+        else:
+            raise ValueError(
+                "Expected a 2D mask or a channel-first/channel-last image mask, "
+                f"but received shape {mask_array.shape}."
+            )
+    else:
+        mask_array = mask_array > 0
 
     if mask_array.shape != size:
         mask_image = Image.fromarray(mask_array.astype(np.uint8) * 255)

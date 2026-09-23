@@ -1,9 +1,15 @@
 """Model construction utilities for INSID3."""
 
+import os
+from pathlib import Path
+
 import torch
 
 # from models.insid3 import INSID3
 from models.foris import FoRIS
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_DEFAULT_DINOV3_REPO = _PROJECT_ROOT / "third_party" / "dinov3"
 
 _HUB_NAMES = {
     "small": "dinov3_vits16",
@@ -12,17 +18,33 @@ _HUB_NAMES = {
 }
 
 _WEIGHTS = {
-    "small": "/home/user9/dataset/user9/DINOV3/dinov3_vits16_pretrain_lvd1689m-08c60483.pth",
-    "base": "/home/user9/dataset/user9/DINOV3/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth",
-    "large": "/home/lilinfei/FoRIS/pretrain/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth",
+    "small": str(_PROJECT_ROOT / "pretrain" / "dinov3_vits16_pretrain_lvd1689m-08c60483.pth"),
+    "base": str(_PROJECT_ROOT / "pretrain" / "dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"),
+    "large": str(_PROJECT_ROOT / "pretrain" / "dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"),
 }
 
 
 def _build_encoder(model_size: str = "large"):
+    repo_dir = Path(
+        os.environ.get("DINOV3_REPO_DIR", str(_DEFAULT_DINOV3_REPO))
+    ).expanduser()
+    if not (repo_dir / "hubconf.py").is_file():
+        raise FileNotFoundError(
+            "DINOv3 source is required locally so inference does not depend on "
+            "a GitHub connection. Clone or copy the DINOv3 repository to "
+            f"{repo_dir}, or set DINOV3_REPO_DIR to a directory containing hubconf.py."
+        )
+    weight_path = Path(_WEIGHTS[model_size]).expanduser()
+    if not weight_path.is_file():
+        raise FileNotFoundError(
+            f"DINOv3 {model_size} weights were not found: {weight_path}. "
+            "Place the checkpoint in FoRIS/pretrain or update _WEIGHTS."
+        )
     return torch.hub.load(
-        "facebookresearch/dinov3",
+        str(repo_dir),
         _HUB_NAMES[model_size],
-        weights=_WEIGHTS[model_size],
+        source="local",
+        weights=str(weight_path),
     )
 
 
